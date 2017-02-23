@@ -103,24 +103,11 @@ static int dfu_issue_control(struct dfu_device *dfudev, u8 *buff, int len)
 	return dfudev->ctrl_status;
 }
 
-static inline int dfudev_reset(struct dfu_device *dfudev)
-{
-	int retusb;
-
-	retusb = usb_lock_device_for_reset(dfudev->usbdev, dfudev->intf);
-	if (retusb == 0)
-		retusb = usb_reset_device(dfudev->usbdev);
-	else
-		dev_err(&dfudev->intf->dev, "Device busy\n");
-
-	return retusb;
-}
-
-static void submit_detach(struct dfu_device *dfudev)
+static int submit_detach(struct dfu_device *dfudev)
 {
 	int tmout, retusb;
 	
-	tmout = dfudev->dettmout > 500? 500: dfudev->dettmout;
+	tmout = dfudev->dettmout > 2000? 2000: dfudev->dettmout;
 	dfudev->ctrl_req.bRequestType = 0b00100001;
 	dfudev->ctrl_req.bRequest = USB_DFU_DETACH;
 	dfudev->ctrl_req.wValue = cpu_to_le16(tmout);
@@ -128,8 +115,7 @@ static void submit_detach(struct dfu_device *dfudev)
 	dfudev->ctrl_req.wLength = 0;
 	dfudev->ctrl_pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
 	retusb = dfu_issue_control(dfudev, NULL, 0);
-	if (((dfudev->attr & 0x08) == 0) && retusb == 0)
-		dfudev_reset(dfudev);
+	return retusb;
 }
 
 static int dfu_state(struct dfu_device *dfudev)
@@ -190,7 +176,7 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	if (count > 0 && *buf == '-' && (*(buf+1) == '\n' || *(buf+1) == 0)) {
 		if (mutex_trylock(&dfudev->devlock)) {
 			if (dfudev->runtime)
-				submit_detach(dfudev);
+				retv = submit_detach(dfudev);
 			else {
 				dfustat = dfu_state(dfudev);
 				dev_info(&dfudev->intf->dev, "DFU State: %d\n",
@@ -205,6 +191,20 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	usb_free_urb(dfudev->ctrl_urb);
 	dfudev->ctrl_urb = NULL;
 	return count;
+}
+
+static ssize_t dfu_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct dfu_device *dfudev;
+	int retv;
+	const char *fmt = "Attribute: %#02.2 Timeout: %d Transfer Size: %d\n";
+
+	retv = 0;
+	dfudev = container_of(attr, struct dfu_device, devattr);
+	retv = snprintf(buf, 128, fmt, dfudev->attr, dfudev->dettmout,
+			dfudev->xfersize);
+	return retv;
 }
 
 static int dfu_probe(struct usb_interface *intf,
@@ -245,8 +245,8 @@ static int dfu_probe(struct usb_interface *intf,
 		dfudev->devattr.attr.name = "attach";
 		dfudev->runtime = 0;
 	}
-	dfudev->devattr.attr.mode = S_IWUSR;
-	dfudev->devattr.show = NULL;
+	dfudev->devattr.attr.mode = S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->devattr.show = dfu_show;
 	dfudev->devattr.store = dfu_switch;
 	retv = device_create_file(&intf->dev, &dfudev->devattr);
 	if (retv == 0)
