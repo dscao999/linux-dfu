@@ -36,21 +36,21 @@ MODULE_DEVICE_TABLE(usb, dfu_ids);
 
 typedef unsigned char u8;
 
-struct __attribute__((packed)) dfufdsc {
+struct dfufdsc {
 	u8 len;
 	u8 dsctyp;
 	u8 attr;
 	u16 tmout;
 	u16 xfersize;
 	u16 ver;
-};
+} __packed;
 
-struct __attribute__((packed)) dfu_status {
+struct dfu_status {
 	u8 bStatus;
 	u8 ptmout[3];
 	u8 bState;
 	u8 istr;
-};
+} __packed;
 
 struct dfu_device {
 	struct mutex devlock;
@@ -106,9 +106,9 @@ static int dfu_issue_control(struct dfu_device *dfudev, u8 *buff, int len)
 static int submit_detach(struct dfu_device *dfudev)
 {
 	int tmout, retusb;
-	
-	tmout = dfudev->dettmout > 2000? 2000: dfudev->dettmout;
-	dfudev->ctrl_req.bRequestType = 0b00100001;
+
+	tmout = dfudev->dettmout > 2000 ? 2000 : dfudev->dettmout;
+	dfudev->ctrl_req.bRequestType = 0x21;
 	dfudev->ctrl_req.bRequest = USB_DFU_DETACH;
 	dfudev->ctrl_req.wValue = cpu_to_le16(tmout);
 	dfudev->ctrl_req.wIndex = cpu_to_le16(dfudev->intfnum);
@@ -123,7 +123,7 @@ static int dfu_state(struct dfu_device *dfudev)
 	u8 state;
 	int retv;
 
-	dfudev->ctrl_req.bRequestType = 0b10100001;
+	dfudev->ctrl_req.bRequestType = 0xa1;
 	dfudev->ctrl_req.bRequest = USB_DFU_GETSTATE;
 	dfudev->ctrl_req.wValue = 0;
 	dfudev->ctrl_req.wIndex = cpu_to_le16(dfudev->intfnum);
@@ -142,8 +142,8 @@ static int dfu_status(struct dfu_device *dfudev)
 {
 	int retv;
 	struct dfu_status dfust;
-	
-	dfudev->ctrl_req.bRequestType = 0b10100001;
+
+	dfudev->ctrl_req.bRequestType = 0xa1;
 	dfudev->ctrl_req.bRequest = USB_DFU_GETSTATUS;
 	dfudev->ctrl_req.wValue = 0;
 	dfudev->ctrl_req.wIndex = cpu_to_le16(dfudev->intfnum);
@@ -198,7 +198,7 @@ static ssize_t dfu_show(struct device *dev, struct device_attribute *attr,
 {
 	struct dfu_device *dfudev;
 	int retv;
-	const char *fmt = "Attribute: %#02.2 Timeout: %d Transfer Size: %d\n";
+	const char *fmt = "Attribute: %#02.2x Timeout: %d Transfer Size: %d\n";
 
 	retv = 0;
 	dfudev = container_of(attr, struct dfu_device, devattr);
@@ -284,7 +284,7 @@ static int __init usbdfu_init(void)
 
 	retv = usb_register(&dfu_driver);
 	if (retv)
-		printk(KERN_ERR "Cannot register USB DFU driver\n");
+		pr_err("Cannot register USB DFU driver: %d\n", retv);
 	return retv;
 }
 
