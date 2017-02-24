@@ -25,6 +25,8 @@ static int max_dfus = 8;
 module_param(max_dfus, int, S_IRUGO);
 static int urb_timeout = 200; /* milliseconds */
 module_param(urb_timeout, int, S_IRUGO | S_IWUSR);
+static int detach_timeout = 2000; /* 2 seconds */
+module_param(detach_timeout, int, S_IRUGO | S_IWUSR);
 
 static const struct usb_device_id dfu_ids[] = {
 	{ .match_flags = USB_DEVICE_ID_MATCH_INT_INFO |
@@ -183,8 +185,8 @@ static void do_switch(struct dfu_device *dfudev, struct dfu_control *ctrl)
 { 
 	int tmout;
 
-	tmout = dfudev->dettmout > 2000 ?
-				2000 : dfudev->dettmout;
+	tmout = dfudev->dettmout > detach_timeout ?
+				detach_timeout : dfudev->dettmout;
 	ctrl->req.bRequestType = 0x21;
 	ctrl->req.bRequest = USB_DFU_DETACH;
 	ctrl->req.wValue = cpu_to_le16(tmout);
@@ -300,12 +302,12 @@ static int dfu_probe(struct usb_interface *intf,
 	dfudev->devattr.attr.mode = S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH;
 	dfudev->devattr.show = dfu_show;
 	dfudev->devattr.store = dfu_switch;
+	usb_set_intfdata(intf, dfudev);
 	retv = device_create_file(&intf->dev, &dfudev->devattr);
 	if (retv != 0) {
 		dev_err(&intf->dev, "Cannot create sysfs file %d\n", retv);
 		goto err_10;
 	}
-	usb_set_intfdata(intf, dfudev);
 	if (dfudev->runtime)
 		return retv;
 
@@ -317,8 +319,8 @@ static int dfu_probe(struct usb_interface *intf,
 				retv);
 		goto err_20;
 	}
-	dfudev->sysdev = device_create(dfu_class, NULL, dfudev->devnum, dfudev, 
-			"dfu%d", dfudev->index);
+	dfudev->sysdev = device_create(dfu_class, &intf->dev,
+			dfudev->devnum, dfudev, "dfu%d", dfudev->index);
 	if (IS_ERR(dfudev->sysdev)) {
 		retv = (int)PTR_ERR(dfudev->sysdev);
 		dev_err(&dfudev->intf->dev, "Cannot create device file: %d\n",
