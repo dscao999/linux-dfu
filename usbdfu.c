@@ -3,10 +3,14 @@
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Dashi Cao");
 MODULE_DESCRIPTION("USB DFU Class Driver");
+
+#define MAX_DFUS	8
 
 #define USB_DFU_DETACH		0
 #define USB_DFU_GETSTATUS	3
@@ -52,109 +56,86 @@ struct dfu_status {
 	u8 istr;
 } __packed;
 
+static const char *DFUDEV_NAME = "dfu";
+static dev_t dfu_devnum;
+static struct class *dfu_class;
+
 struct dfu_device {
-	struct mutex devlock;
+	struct mutex dfulock;
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
 	struct device_attribute devattr;
-	struct usb_ctrlrequest ctrl_req;
-	struct urb *ctrl_urb;
 	int ctrl_pipe;
 	int ctrl_status;
-	struct completion ctrl_done;
 	int attr;
 	int dettmout;
 	int xfersize;
 	int runtime;
 	int intfnum;
+
+	struct cdev dfu_cdev;
+};
+
+struct dfu_control {
+	struct urb *urb;
+	struct completion urbdone;
+	volatile int status;
+	struct usb_ctrlrequest req;
+	int pipe;
+	u8 *buff;
+	int len;
 };
 
 static void dfu_ctrlurb_done(struct urb *urb)
 {
-	struct dfu_device *dfudev;
+	struct dfu_control *ctrl;
 
-	dfudev = urb->context;
-	dfudev->ctrl_status = urb->status;
-	complete(&dfudev->ctrl_done);
+	ctrl = urb->context;
+	ctrl->status = urb->status;
+	complete(&ctrl->urbdone);
 }
 
-static int dfu_issue_control(struct dfu_device *dfudev, u8 *buff, int len)
+static int dfu_submit_urb(struct dfu_device *dfudev, struct dfu_control *ctrl)
 {
 	unsigned long jiff_wait;
 	int retusb;
 
-	usb_fill_control_urb(dfudev->ctrl_urb, dfudev->usbdev,
-			dfudev->ctrl_pipe, (u8 *)&dfudev->ctrl_req, buff, len,
-				dfu_ctrlurb_done, dfudev);
-	dfudev->ctrl_status = -65535;
-	init_completion(&dfudev->ctrl_done);
-	retusb = usb_submit_urb(dfudev->ctrl_urb, GFP_KERNEL);
+	ctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!ctrl->urb) {
+		dev_err(&dfudev->intf->dev, "Cannot allocate USB URB\n");
+		return -ENOMEM;
+	}
+	usb_fill_control_urb(ctrl->urb, dfudev->usbdev, ctrl->pipe,
+			(u8 *)&ctrl->req, ctrl->buff, ctrl->len,
+			dfu_ctrlurb_done, ctrl);
+	init_completion(&ctrl->urbdone);
+	retusb = usb_submit_urb(ctrl->urb, GFP_KERNEL);
 	if (retusb == 0) {
 		jiff_wait = msecs_to_jiffies(USB_URB_TIMEOUT);
-		if (!wait_for_completion_timeout(&dfudev->ctrl_done,
-				jiff_wait)) {
-			usb_unlink_urb(dfudev->ctrl_urb);
-			wait_for_completion(&dfudev->ctrl_done);
+		if (!wait_for_completion_timeout(&ctrl->urbdone, jiff_wait)) {
+			usb_unlink_urb(ctrl->urb);
+			wait_for_completion(&ctrl->urbdone);
 			dev_err(&dfudev->intf->dev, "Control URB cancelled\n");
 		}
 	} else
 		dev_err(&dfudev->intf->dev, "Cannot submit URB: %d\n", retusb);
+	usb_free_urb(ctrl->urb);
 
-	return dfudev->ctrl_status;
-}
-
-static int submit_detach(struct dfu_device *dfudev)
-{
-	int tmout, retusb;
-
-	tmout = dfudev->dettmout > 2000 ? 2000 : dfudev->dettmout;
-	dfudev->ctrl_req.bRequestType = 0x21;
-	dfudev->ctrl_req.bRequest = USB_DFU_DETACH;
-	dfudev->ctrl_req.wValue = cpu_to_le16(tmout);
-	dfudev->ctrl_req.wIndex = cpu_to_le16(dfudev->intfnum);
-	dfudev->ctrl_req.wLength = 0;
-	dfudev->ctrl_pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
-	retusb = dfu_issue_control(dfudev, NULL, 0);
-	return retusb;
-}
-
-static int dfu_state(struct dfu_device *dfudev)
-{
-	u8 state;
-	int retv;
-
-	dfudev->ctrl_req.bRequestType = 0xa1;
-	dfudev->ctrl_req.bRequest = USB_DFU_GETSTATE;
-	dfudev->ctrl_req.wValue = 0;
-	dfudev->ctrl_req.wIndex = cpu_to_le16(dfudev->intfnum);
-	dfudev->ctrl_req.wLength = cpu_to_le16(1);
-	dfudev->ctrl_pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
-
-	retv = dfu_issue_control(dfudev, &state, sizeof(state));
-	if (retv == 0)
-		retv = state;
-	else
-		dev_err(&dfudev->intf->dev, "Cannot get DFU State\n");
-	return retv;
+	return ctrl->status;
 }
 
 static int dfu_status(struct dfu_device *dfudev)
 {
 	int retv;
-	struct dfu_status dfust;
+	struct dfu_control ctrl;
 
-	dfudev->ctrl_req.bRequestType = 0xa1;
-	dfudev->ctrl_req.bRequest = USB_DFU_GETSTATUS;
-	dfudev->ctrl_req.wValue = 0;
-	dfudev->ctrl_req.wIndex = cpu_to_le16(dfudev->intfnum);
-	dfudev->ctrl_req.wLength = cpu_to_le16(6);
-	dfudev->ctrl_pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
+	ctrl.req.bRequestType = 0xa1;
+	ctrl.req.bRequest = USB_DFU_GETSTATUS;
+	ctrl.req.wValue = 0;
+	ctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl.req.wLength = cpu_to_le16(6);
+	ctrl.pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
 
-	retv = dfu_issue_control(dfudev, (u8 *)&dfust, sizeof(dfust));
-	if (retv == 0)
-		retv = dfust.bStatus;
-	else
-		dev_err(&dfudev->intf->dev, "Cannot get DFU State\n");
 	return retv;
 }
 
@@ -162,34 +143,41 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
 	struct dfu_device *dfudev;
-	int retv, dfustat;
+	int tmout;
+	struct dfu_control ctrl;
 
-	retv = 0;
 	dfudev = container_of(attr, struct dfu_device, devattr);
-	dfudev->ctrl_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dfudev->ctrl_urb) {
-		dev_err(&dfudev->intf->dev,
-				"Cannot allocate USB URB\n");
-		return count;
-	}
 
 	if (count > 0 && *buf == '-' && (*(buf+1) == '\n' || *(buf+1) == 0)) {
-		if (mutex_trylock(&dfudev->devlock)) {
-			if (dfudev->runtime)
-				retv = submit_detach(dfudev);
-			else {
-				dfustat = dfu_state(dfudev);
+		ctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
+		ctrl.buff = NULL;
+		ctrl.len = 0;
+		if (dfudev->runtime) {
+			tmout = dfudev->dettmout > 2000 ?
+					2000 : dfudev->dettmout;
+			ctrl.req.bRequestType = 0x21;
+			ctrl.req.bRequest = USB_DFU_DETACH;
+			ctrl.req.wValue = cpu_to_le16(tmout);
+			ctrl.req.wLength = 0;
+			ctrl.pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
+			dfu_submit_urb(dfudev, &ctrl);
+		} else {
+			u8 bState;
+
+			ctrl.req.bRequestType = 0xa1;
+			ctrl.req.bRequest = USB_DFU_GETSTATE;
+			ctrl.req.wValue = 0;
+			ctrl.req.wLength = cpu_to_le16(1);
+			ctrl.pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
+			ctrl.buff = &bState;
+			ctrl.len = 1;
+			if (dfu_submit_urb(dfudev, &ctrl) == 0)
 				dev_info(&dfudev->intf->dev, "DFU State: %d\n",
-						dfustat);
-			}
-			mutex_unlock(&dfudev->devlock);
-		} else
-			dev_err(dev, "Device busy\n");
+						(int)bState);
+		}
 	} else
 		dev_err(dev, "Invalid Command: %c\n", *buf);
 
-	usb_free_urb(dfudev->ctrl_urb);
-	dfudev->ctrl_urb = NULL;
 	return count;
 }
 
@@ -227,14 +215,13 @@ static int dfu_probe(struct usb_interface *intf,
 	if (!dfudev)
 		return -ENOMEM;
 
-	dfudev->ctrl_urb = NULL;
 	dfudev->attr = dfufdsc->attr;
 	dfudev->dettmout = le16_to_cpu(dfufdsc->tmout);
 	dfudev->xfersize = le16_to_cpu(dfufdsc->xfersize);
 	dfudev->intf = intf;
 	dfudev->usbdev = interface_to_usbdev(intf);
 	dfudev->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
-	mutex_init(&dfudev->devlock);
+	mutex_init(&dfudev->dfulock);
 
 	retv = 0;
 	intfdsc = &intf->cur_altsetting->desc;
@@ -253,9 +240,16 @@ static int dfu_probe(struct usb_interface *intf,
 		usb_set_intfdata(intf, dfudev);
 	else {
 		dev_err(&intf->dev, "Cannot create sysfs file \"detach\"\n");
-		kfree(dfudev);
+		goto err_10;
 	}
 
+	if (retv < 0)
+		goto err_10;
+
+	return retv;
+
+err_10:
+	kfree(dfudev);
 	return retv;
 }
 
@@ -266,8 +260,6 @@ static void dfu_disconnect(struct usb_interface *intf)
 	dev = usb_get_intfdata(intf);
 	device_remove_file(&intf->dev, &dev->devattr);
 	usb_set_intfdata(intf, NULL);
-	while (mutex_lock_interruptible(&dev->devlock) != 0)
-		dev_err(&intf->dev, "Unable to get DFU lock\n");
 	kfree(dev);
 }
 
@@ -283,13 +275,36 @@ static int __init usbdfu_init(void)
 	int retv;
 
 	retv = usb_register(&dfu_driver);
-	if (retv)
+	if (retv) {
 		pr_err("Cannot register USB DFU driver: %d\n", retv);
+		return retv;
+	}
+	retv = alloc_chrdev_region(&dfu_devnum, 0, MAX_DFUS, DFUDEV_NAME);
+	if (retv != 0) {
+		pr_err("Cannot allocate a char major number: %d\n", retv);
+		goto err_10;
+	}
+	dfu_class = class_create(THIS_MODULE, DFUDEV_NAME);
+	if (IS_ERR(dfu_class)) {
+		retv = -ENOMEM;
+		pr_err("Cannot create DFU class, Out of Memory!\n");
+		goto err_20;
+	}
+
+
+	return retv;
+
+err_20:
+	unregister_chrdev_region(dfu_devnum, MAX_DFUS);
+err_10:
+	usb_deregister(&dfu_driver);
 	return retv;
 }
 
 static void __exit usbdfu_exit(void)
 {
+	class_destroy(dfu_class);
+	unregister_chrdev_region(dfu_devnum, MAX_DFUS);
 	usb_deregister(&dfu_driver);
 }
 
