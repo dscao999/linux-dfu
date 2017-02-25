@@ -6,6 +6,7 @@
  * USB Abstract Control Model driver for USB Device Firmware Upgrade
  *
 */
+#include <stdarg.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/usb.h>
@@ -155,15 +156,23 @@ static int dfu_submit_urb(struct dfu_device *dfudev, struct dfu_control *ctrl)
 		if (!wait_for_completion_timeout(&ctrl->urbdone, jiff_wait)) {
 			usb_unlink_urb(ctrl->urb);
 			wait_for_completion(&ctrl->urbdone);
-			dev_err(&dfudev->intf->dev, "Control URB cancelled\n");
+			dev_err(&dfudev->intf->dev,
+				"URB req type: %2.2x, req: %2.2x cancelled\n",
+				(int)ctrl->req.bRequestType,
+				(int)ctrl->req.bRequest);
 		}
 	} else
-		dev_err(&dfudev->intf->dev, "Cannot submit URB: %d\n", retusb);
+		dev_err(&dfudev->intf->dev,
+			"URB type: %2.2x, req: %2.2x submit failed: %d\n",
+			 (int)ctrl->req.bRequestType,
+			(int)ctrl->req.bRequest, retusb);
 	if (alloc)
 		usb_free_urb(ctrl->urb);
-	if (ctrl->status)
-		dev_err(&dfudev->intf->dev, "URB request failed: %d\n",
-				ctrl->status);
+	if (ACCESS_ONCE(ctrl->status))
+		dev_err(&dfudev->intf->dev,
+			"URB type: %2.2x, req: %2.2x request failed: %d\n",
+			(int)ctrl->req.bRequestType, (int)ctrl->req.bRequest,
+			ctrl->status);
 
 	return ctrl->status;
 }
