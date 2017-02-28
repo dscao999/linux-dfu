@@ -409,13 +409,20 @@ static ssize_t dfu_show(struct device *dev, struct device_attribute *attr,
 			char *buf)
 {
 	struct dfu_device *dfudev;
-	int retv;
-	const char *fmt = "Attribute: %#02.2x Timeout: %d Transfer Size: %d\n";
+	int retv, bst;
+	struct dfu_control ctrl;
+	const char *fmt = "Attribute: %#02.2x Timeout: %d Transfer Size: %d ";
 
 	retv = 0;
 	dfudev = container_of(attr, struct dfu_device, devattr);
+	ctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl.buff = NULL;
+	ctrl.len = 0;
+	
+	bst = dfu_get_state(dfudev, &ctrl);
 	retv = snprintf(buf, 128, fmt, dfudev->attr, dfudev->dettmout,
 			dfudev->xfersize);
+	retv += snprintf(buf+retv, 128-retv, "Current State: %d\n", bst);
 	return retv;
 }
 
