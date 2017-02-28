@@ -34,6 +34,7 @@ MODULE_DESCRIPTION("USB DFU Class Driver");
 
 #define USB_DFU_FUNC_DSCLEN	0x09
 #define USB_DFU_FUNC_DSCTYP	0x21
+#define USB_DFU_ERROR_CODE	65535
 
 static int max_dfus = 8;
 module_param(max_dfus, int, S_IRUGO);
@@ -132,10 +133,33 @@ static void dfu_ctrlurb_done(struct urb *urb)
 	complete(&ctrl->urbdone);
 }
 
+static int dfu_get_status(struct dfu_device *dfudev, struct dfu_control *ctrl,
+		struct dfu_status *st);
+
+static int dfu_urb_timeout(struct dfu_device *dfudev, struct dfu_control *ctrl)
+{
+	int retv;
+	struct dfu_control tmctrl;
+	struct dfu_status st;
+
+	retv = USB_DFU_ERROR_CODE;
+	usb_unlink_urb(ctrl->urb);
+	wait_for_completion(&ctrl->urbdone);
+	if (ctrl->req.bRequest != USB_DFU_ABORT)
+		dev_err(&dfudev->intf->dev,
+			"URB req type: %2.2x, req: %2.2x cancelled\n",
+			(int)ctrl->req.bRequestType,
+			(int)ctrl->req.bRequest);
+	tmctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
+	if (dfu_get_status(dfudev, &tmctrl, &st) == 0)
+		retv = st.bStatus;
+	return retv;
+}
+
 static int dfu_submit_urb(struct dfu_device *dfudev, struct dfu_control *ctrl)
 {
+	int retusb, alloc, retv;
 	unsigned long jiff_wait;
-	int retusb, alloc;
 
 	alloc = 0;
 	if (ctrl->urb == NULL) {
@@ -150,25 +174,21 @@ static int dfu_submit_urb(struct dfu_device *dfudev, struct dfu_control *ctrl)
 			(u8 *)&ctrl->req, ctrl->buff, ctrl->len,
 			dfu_ctrlurb_done, ctrl);
 	init_completion(&ctrl->urbdone);
+	ctrl->status = 65535;
 	retusb = usb_submit_urb(ctrl->urb, GFP_KERNEL);
 	if (retusb == 0) {
 		jiff_wait = msecs_to_jiffies(urb_timeout);
-		if (!wait_for_completion_timeout(&ctrl->urbdone, jiff_wait)) {
-			usb_unlink_urb(ctrl->urb);
-			wait_for_completion(&ctrl->urbdone);
-			dev_err(&dfudev->intf->dev,
-				"URB req type: %2.2x, req: %2.2x cancelled\n",
-				(int)ctrl->req.bRequestType,
-				(int)ctrl->req.bRequest);
-		}
+		if (!wait_for_completion_timeout(&ctrl->urbdone, jiff_wait))
+			ctrl->status = dfu_urb_timeout(dfudev, ctrl);
 	} else
 		dev_err(&dfudev->intf->dev,
 			"URB type: %2.2x, req: %2.2x submit failed: %d\n",
-			 (int)ctrl->req.bRequestType,
+			(int)ctrl->req.bRequestType,
 			(int)ctrl->req.bRequest, retusb);
 	if (alloc)
 		usb_free_urb(ctrl->urb);
-	if (ACCESS_ONCE(ctrl->status))
+	retv = ACCESS_ONCE(ctrl->status);
+	if (retv && ctrl->req.bRequest != USB_DFU_ABORT)
 		dev_err(&dfudev->intf->dev,
 			"URB type: %2.2x, req: %2.2x request failed: %d\n",
 			(int)ctrl->req.bRequestType, (int)ctrl->req.bRequest,
