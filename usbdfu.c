@@ -139,7 +139,7 @@ static int dfu_get_status(struct dfu_device *dfudev, struct dfu_control *ctrl,
 static int dfu_urb_timeout(struct dfu_device *dfudev, struct dfu_control *ctrl)
 {
 	int retv;
-	struct dfu_control tmctrl;
+	struct dfu_control *tmctrl;
 	struct dfu_status st;
 
 	retv = USB_DFU_ERROR_CODE;
@@ -150,9 +150,11 @@ static int dfu_urb_timeout(struct dfu_device *dfudev, struct dfu_control *ctrl)
 			"URB req type: %2.2x, req: %2.2x cancelled\n",
 			(int)ctrl->req.bRequestType,
 			(int)ctrl->req.bRequest);
-	tmctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
-	if (dfu_get_status(dfudev, &tmctrl, &st) == 0)
+	tmctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
+	tmctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	if (dfu_get_status(dfudev, tmctrl, &st) == 0)
 		retv = st.bStatus;
+	kfree(tmctrl);
 	return retv;
 }
 
@@ -203,7 +205,7 @@ static int dfu_get_state(struct dfu_device *dfudev, struct dfu_control *ctrl);
 static int dfu_open(struct inode *inode, struct file *file)
 {
 	struct dfu_device *dfudev;
-	struct dfu_control ctrl;
+	struct dfu_control *ctrl;
 	int state, retv;
 
 	retv = 0;
@@ -211,8 +213,10 @@ static int dfu_open(struct inode *inode, struct file *file)
 	file->private_data = dfudev;
 	if (mutex_lock_interruptible(&dfudev->dfulock))
 		return -EBUSY;
-	ctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
-	state = dfu_get_state(dfudev, &ctrl);
+	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
+	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	state = dfu_get_state(dfudev, ctrl);
+	kfree(ctrl);
 	if (state != dfuIDLE) {
 		dev_err(&dfudev->intf->dev, "Bad Initial State: %d\n", state);
 		retv =  -ETXTBSY;
@@ -246,19 +250,20 @@ static int dfu_abort(struct dfu_device *dfudev, struct dfu_control *ctrl)
 static int dfu_release(struct inode *inode, struct file *filp)
 {
 	struct dfu_device *dfudev;
-	struct dfu_control ctrl;
+	struct dfu_control *ctrl;
 	int retv;
 
 	dfudev = filp->private_data;
 	kfree(dfudev->databuf);
-	ctrl.req.wIndex = le16_to_cpu(dfudev->intfnum);
-	retv = dfu_get_state(dfudev, &ctrl);
+	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
+	ctrl->req.wIndex = le16_to_cpu(dfudev->intfnum);
+	retv = dfu_get_state(dfudev, ctrl);
 	if (retv == dfuERROR)
-		dfu_clr_status(dfudev, &ctrl);
+		dfu_clr_status(dfudev, ctrl);
 	else if (retv != dfuIDLE)
-		dfu_abort(dfudev, &ctrl);
+		dfu_abort(dfudev, ctrl);
 	mdelay(100);
-	retv = dfu_get_state(dfudev, &ctrl);
+	retv = dfu_get_state(dfudev, ctrl);
 	if (retv != dfuIDLE)
 		dev_err(&dfudev->intf->dev, "Need Reset! Stuck in State: %d\n",
 				retv);
@@ -271,13 +276,14 @@ ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 {
 	struct dfu_device *dfudev;
 	int blknum, retv, state, numb, nbytes;
-	struct dfu_control upctrl;
+	struct dfu_control *upctrl;
 
 	dfudev = filp->private_data;
 	if (count % dfudev->xfersize != 0)
 		return -EINVAL;
-	upctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
-	state = dfu_get_state(dfudev, &upctrl);
+	upctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
+	upctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	state = dfu_get_state(dfudev, upctrl);
 	if (*f_pos == 0 && state != dfuIDLE) {
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", state);
 		return -EINVAL;
@@ -296,30 +302,33 @@ ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	if (count == 0)
 		return 0;
 
-	upctrl.urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!upctrl.urb)
+	upctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!upctrl->urb) {
+		kfree(upctrl);
 		return -ENOMEM;
+	}
 
 	blknum = *f_pos / dfudev->xfersize;
-	upctrl.req.bRequestType = 0xa1;
-	upctrl.req.bRequest = USB_DFU_UPLOAD;
-	upctrl.req.wLength = cpu_to_le16(dfudev->xfersize);
-	upctrl.pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
-	upctrl.buff = dfudev->databuf;
-	upctrl.len = dfudev->xfersize;
+	upctrl->req.bRequestType = 0xa1;
+	upctrl->req.bRequest = USB_DFU_UPLOAD;
+	upctrl->req.wLength = cpu_to_le16(dfudev->xfersize);
+	upctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
+	upctrl->buff = dfudev->databuf;
+	upctrl->len = dfudev->xfersize;
 
 	numb = 0;
 	do {
-		upctrl.nxfer = 0;
-		upctrl.req.wValue = cpu_to_le16(blknum);
-		retv = dfu_submit_urb(dfudev, &upctrl);
-		nbytes = copy_to_user(buff+numb, dfudev->databuf, upctrl.nxfer);
-		numb += upctrl.nxfer;
+		upctrl->nxfer = 0;
+		upctrl->req.wValue = cpu_to_le16(blknum);
+		retv = dfu_submit_urb(dfudev, upctrl);
+		nbytes = copy_to_user(buff+numb, dfudev->databuf, upctrl->nxfer);
+		numb += upctrl->nxfer;
 		blknum++;
-	} while (upctrl.nxfer == upctrl.len && numb < count && retv == 0);
+	} while (upctrl->nxfer == upctrl->len && numb < count && retv == 0);
 	*f_pos += numb;
 
-	usb_free_urb(upctrl.urb);
+	usb_free_urb(upctrl->urb);
+	kfree(upctrl);
 	return numb;
 }
 
@@ -381,39 +390,41 @@ static int dfu_clr_status(struct dfu_device *dfudev, struct dfu_control *ctrl)
 
 static int dfu_get_state(struct dfu_device *dfudev, struct dfu_control *ctrl)
 {
-	u8 bState;
+	u8 *bState;
 	int retv;
 
+	bState = kmalloc(4, GFP_KERNEL);
 	ctrl->req.bRequestType = 0xa1;
 	ctrl->req.bRequest = USB_DFU_GETSTATE;
 	ctrl->req.wValue = 0;
 	ctrl->req.wLength = cpu_to_le16(1);
 	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = &bState;
+	ctrl->buff = bState;
 	ctrl->len = 1;
 	ctrl->urb = NULL;
 	retv = dfu_submit_urb(dfudev, ctrl);
 	if (retv == 0)
-		return bState;
-	else
-		return retv;
+		retv = *bState;
+	kfree(bState);
+	return retv;
 }
 
 static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
 	struct dfu_device *dfudev;
-	struct dfu_control ctrl;
+	struct dfu_control *ctrl;
 	int state;
 
 	dfudev = container_of(attr, struct dfu_device, devattr);
 
+	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
 	if (count > 0 && *buf == '-' && (*(buf+1) == '\n' || *(buf+1) == 0)) {
-		ctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
+		ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 		if (dfudev->proto == 1)
-			dfu_do_switch(dfudev, &ctrl);
+			dfu_do_switch(dfudev, ctrl);
 		else {
-			state = dfu_get_state(dfudev, &ctrl);
+			state = dfu_get_state(dfudev, ctrl);
 			if (state >= 0)
 				dev_info(&dfudev->intf->dev, "DFU State: %d\n",
 						state);
@@ -422,6 +433,7 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	} else
 		dev_err(dev, "Invalid Command: %c\n", *buf);
 
+	kfree(ctrl);
 	return count;
 }
 
@@ -430,16 +442,15 @@ static ssize_t dfu_show(struct device *dev, struct device_attribute *attr,
 {
 	struct dfu_device *dfudev;
 	int retv, bst;
-	struct dfu_control ctrl;
+	struct dfu_control *ctrl;
 	const char *fmt = "Attribute: %#02.2x Timeout: %d Transfer Size: %d ";
 
 	retv = 0;
 	dfudev = container_of(attr, struct dfu_device, devattr);
-	ctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
-	ctrl.buff = NULL;
-	ctrl.len = 0;
+	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
+	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 	
-	bst = dfu_get_state(dfudev, &ctrl);
+	bst = dfu_get_state(dfudev, ctrl);
 	retv = snprintf(buf, 128, fmt, dfudev->attr, dfudev->dettmout,
 			dfudev->xfersize);
 	if (dfudev->proto == 1)
@@ -447,6 +458,7 @@ static ssize_t dfu_show(struct device *dev, struct device_attribute *attr,
 	else
 		retv += snprintf(buf+retv, 128-retv, "Current State: %d\n",
 				bst);
+	kfree(ctrl);
 	return retv;
 }
 
