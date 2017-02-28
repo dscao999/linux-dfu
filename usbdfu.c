@@ -105,7 +105,7 @@ struct dfu_device {
 	int attr;
 	int dettmout;
 	int xfersize;
-	int runtime;
+	int proto;
 	int intfnum;
 
 	struct cdev dfu_cdev;
@@ -390,7 +390,7 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 
 	if (count > 0 && *buf == '-' && (*(buf+1) == '\n' || *(buf+1) == 0)) {
 		ctrl.req.wIndex = cpu_to_le16(dfudev->intfnum);
-		if (dfudev->runtime)
+		if (dfudev->proto == 1)
 			dfu_do_switch(dfudev, &ctrl);
 		else {
 			state = dfu_get_state(dfudev, &ctrl);
@@ -422,7 +422,11 @@ static ssize_t dfu_show(struct device *dev, struct device_attribute *attr,
 	bst = dfu_get_state(dfudev, &ctrl);
 	retv = snprintf(buf, 128, fmt, dfudev->attr, dfudev->dettmout,
 			dfudev->xfersize);
-	retv += snprintf(buf+retv, 128-retv, "Current State: %d\n", bst);
+	if (dfudev->proto == 1)
+		retv += snprintf(buf+retv, 128-retv, "\n");
+	else
+		retv += snprintf(buf+retv, 128-retv, "Current State: %d\n",
+				bst);
 	return retv;
 }
 
@@ -465,10 +469,10 @@ static int dfu_probe(struct usb_interface *intf,
 	intfdsc = &intf->cur_altsetting->desc;
 	if (intfdsc->bInterfaceProtocol == USB_DFU_PROTO_RUNTIME) {
 		dfudev->devattr.attr.name = "detach";
-		dfudev->runtime = 1;
+		dfudev->proto = 1;
 	} else {
 		dfudev->devattr.attr.name = "attach";
-		dfudev->runtime = 0;
+		dfudev->proto = 2;
 	}
 	dfudev->devattr.attr.mode = S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH;
 	dfudev->devattr.show = dfu_show;
@@ -479,7 +483,7 @@ static int dfu_probe(struct usb_interface *intf,
 		dev_err(&intf->dev, "Cannot create sysfs file %d\n", retv);
 		goto err_10;
 	}
-	if (dfudev->runtime)
+	if (dfudev->proto == 1)
 		return retv;
 
 	cdev_init(&dfudev->dfu_cdev, &dfu_fops);
@@ -517,7 +521,7 @@ static void dfu_disconnect(struct usb_interface *intf)
 	struct dfu_device *dfudev;
 
 	dfudev = usb_get_intfdata(intf);
-	if (!dfudev->runtime) {
+	if (dfudev->proto == 2) {
 		device_destroy(dfu_class, dfudev->devnum);
 		cdev_del(&dfudev->dfu_cdev);
 	}
