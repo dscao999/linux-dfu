@@ -289,8 +289,9 @@ ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	struct dfu_device *dfudev;
 	int blknum, retv, numb, nbytes;
 	struct dfu_control *opctrl, *stctrl;
-	int dfust;
+	int dfust, dma;
 	dma_addr_t dmabuf;
+	struct device *ctrler;
 
 	dfudev = filp->private_data;
 	if (count % dfudev->xfersize != 0)
@@ -320,6 +321,9 @@ ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	if (!dfudev->opctrl->urb)
 		return -ENOMEM;
 
+	ctrler = dfudev->usbdev->bus->controller;
+	dmabuf = ~0;
+	dma = 0;
 	blknum = *f_pos / dfudev->xfersize;
 	opctrl->req.bRequestType = 0xa1;
 	opctrl->req.bRequest = USB_DFU_UPLOAD;
@@ -328,12 +332,13 @@ ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	opctrl->buff = dfudev->databuf;
 	opctrl->len = dfudev->xfersize;
 	if (dfudev->dma) {
-		struct device *ctrler;
-		ctrler = dfudev->usbdev->bus->controller;
 		dmabuf = dma_map_single(ctrler, opctrl->buff, opctrl->len,
 					DMA_FROM_DEVICE);
-		opctrl->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-		opctrl->urb->transfer_dma = dmabuf;
+		if (!dma_mapping_error(ctrler, dmabuf)) {
+			dma = 1;
+			opctrl->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+			opctrl->urb->transfer_dma = dmabuf;
+		}
 	}
 
 	numb = 0;
@@ -344,16 +349,20 @@ ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 		dfust = stctrl->st.dfuStatus.bState;
 		if ((dfust != dfuUPLOAD_IDLE && dfust != dfuIDLE) ||
 				retv != 0) {
-			dev_err(&dfudev->intf->dev, "Inconsistent state: %d\n",
+			dev_err(&dfudev->intf->dev, "Bad state in uploading: %d\n",
 					dfust);
 			break;
 		}
+		dma_sync_single_for_cpu(ctrler, dmabuf, opctrl->len, DMA_FROM_DEVICE);
 		nbytes = copy_to_user(buff+numb, dfudev->databuf, opctrl->nxfer);
 		numb += ACCESS_ONCE(opctrl->nxfer);
 		blknum++;
 	} while (opctrl->nxfer == opctrl->len && numb < count);
 	*f_pos += numb;
 
+	if (dma)
+		dma_unmap_single(ctrler, dmabuf, opctrl->len,
+				DMA_FROM_DEVICE);
 	usb_free_urb(opctrl->urb);
 	return numb;
 }
