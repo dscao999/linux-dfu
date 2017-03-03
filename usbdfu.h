@@ -27,10 +27,15 @@
 #define USB_DFU_FUNC_DSCTYP	0x21
 #define USB_DFU_ERROR_CODE	65535
 
-#define DFUDEV_NAME	"dfu"
+#define USB_DFU_INTERFACE_INFO(v, cl, sc, pr) \
+        .match_flags = USB_DEVICE_ID_MATCH_VENDOR | \
+			USB_DEVICE_ID_MATCH_INT_INFO, \
+	.idVendor = (v), \
+        .bInterfaceClass = (cl), \
+        .bInterfaceSubClass = (sc), \
+        .bInterfaceProtocol = (pr)
 
-#define USB_VENDOR_LUMINARY 0x1cbe
-#define USB_PRODUCT_STELLARIS_DFU 0x0ff
+#define DFUDEV_NAME	"dfu"
 
 struct dfufdsc {
 	__u8 len;
@@ -108,4 +113,17 @@ struct dfu_device {
 		struct dfu_feature ftus;
 	};
 };
+
+extern struct class *dfu_class;
+
+int dfu_submit_urb(const struct dfu_device *dfudev, struct dfu_control *ctrl);
+int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
+                        const struct usb_device_id *d);
+int dfu_abort(struct dfu_device *dfudev, struct dfu_control *ctrl);
+int dfu_get_status(const struct dfu_device *dfudev, struct dfu_control *ctrl);
+int dfu_get_state(const struct dfu_device *dfudev, struct dfu_control *ctrl);
+int dfu_clr_status(const struct dfu_device *dfudev,
+				struct dfu_control *ctrl);
+void dfu_cleanup(struct usb_interface *intf, struct dfu_device *dfudev);
+
 #endif /* LINUX_USB_DFU_DSCAO__ */

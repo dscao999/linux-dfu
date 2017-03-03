@@ -1,5 +1,6 @@
 ifneq ($(KERNELRELEASE),)
-	obj-m += usbdfu.o
+	obj-m := usbdfu.o
+	obj-m += dfutiva.o
 
 usbdfu.o: usbdfu.h
 

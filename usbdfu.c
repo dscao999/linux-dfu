@@ -33,7 +33,8 @@ static const struct usb_device_id dfu_ids[] = {
 MODULE_DEVICE_TABLE(usb, dfu_ids);
 
 static dev_t dfu_devnum;
-static struct class *dfu_class;
+struct class *dfu_class;
+EXPORT_SYMBOL_GPL(dfu_class);
 
 static atomic_t dfu_index = ATOMIC_INIT(-1);
 
@@ -50,9 +51,6 @@ static void dfu_ctrlurb_done(struct urb *urb)
 static void dfu_urb_timeout(const struct dfu_device *dfudev,
 		struct dfu_control *ctrl)
 {
-	int retv;
-
-	retv = USB_DFU_ERROR_CODE;
 	usb_unlink_urb(ctrl->urb);
 	wait_for_completion(&ctrl->urbdone);
 	if (ctrl->req.bRequest != USB_DFU_ABORT)
@@ -60,50 +58,6 @@ static void dfu_urb_timeout(const struct dfu_device *dfudev,
 			"URB req type: %2.2x, req: %2.2x cancelled\n",
 			(int)ctrl->req.bRequestType,
 			(int)ctrl->req.bRequest);
-}
-
-static int dfu_submit_urb(const struct dfu_device *dfudev,
-		struct dfu_control *ctrl)
-{
-	int retusb, retv, alloc;
-	unsigned long jiff_wait;
-
-	alloc = 0;
-	if (ctrl->urb == NULL) {
-		ctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!ctrl->urb) {
-			dev_err(&dfudev->intf->dev, "Cannot allocate URB\n");
-			return -ENOMEM;
-		}
-		alloc = 1;
-	}
-	usb_fill_control_urb(ctrl->urb, dfudev->usbdev, ctrl->pipe,
-			(__u8 *)&ctrl->req, ctrl->buff, ctrl->len,
-			dfu_ctrlurb_done, ctrl);
-	init_completion(&ctrl->urbdone);
-	ctrl->status = 65535;
-	retusb = usb_submit_urb(ctrl->urb, GFP_KERNEL);
-	if (retusb == 0) {
-		jiff_wait = msecs_to_jiffies(urb_timeout);
-		if (!wait_for_completion_timeout(&ctrl->urbdone, jiff_wait))
-			dfu_urb_timeout(dfudev, ctrl);
-	} else
-		dev_err(&dfudev->intf->dev,
-			"URB type: %2.2x, req: %2.2x submit failed: %d\n",
-			(int)ctrl->req.bRequestType,
-			(int)ctrl->req.bRequest, retusb);
-	if (alloc) {
-		usb_free_urb(ctrl->urb);
-		ctrl->urb = NULL;
-	}
-	retv = ACCESS_ONCE(ctrl->status);
-	if (retv && ctrl->req.bRequest != USB_DFU_ABORT)
-		dev_err(&dfudev->intf->dev,
-			"URB type: %2.2x, req: %2.2x request failed: %d\n",
-			(int)ctrl->req.bRequestType, (int)ctrl->req.bRequest,
-			ctrl->status);
-
-	return ctrl->status;
 }
 
 static int dfu_do_switch(struct dfu_device *dfudev, struct dfu_control *ctrl)
@@ -159,64 +113,6 @@ static ssize_t dfu_show(struct device *dev, struct device_attribute *attr,
 	retv = snprintf(buf, 128, fmt, dfudev->attr, dfudev->dettmout,
 			dfudev->xfersize);
 	return retv;
-}
-
-static int dfu_prepare(struct dfu_device **dfudevp,
-			struct usb_interface *intf,
-			const struct usb_device_id *d)
-{
-	struct dfufdsc *dfufdsc;
-	struct dfu_device *dfudev;
-	int retv, index, dfufdsc_len;
-
-	retv = 0;
-	dfufdsc = (struct dfufdsc *)intf->cur_altsetting->extra;
-	dfufdsc_len = intf->cur_altsetting->extralen;
-	if (!dfufdsc || dfufdsc_len != USB_DFU_FUNC_DSCLEN ||
-			dfufdsc->dsctyp != USB_DFU_FUNC_DSCTYP) {
-		dev_err(&intf->dev, "Invalid DFU functional descriptor\n");
-		return -ENODEV;
-	}
-	index = atomic_inc_return(&dfu_index);
-	if (index >= max_dfus) {
-		retv = -ENODEV;
-		dev_err(&intf->dev, "Maximum supported USB DFU reached: %d\n",
-			max_dfus);
-		goto err_10;
-	}
-
-	*dfudevp = kmalloc(sizeof(struct dfu_device), GFP_KERNEL);
-	if (!*dfudevp) {
-		retv = -ENOMEM;
-		goto err_10;
-	}
-	dfudev = *dfudevp;
-	dfudev->index = index;
-	dfudev->attr = dfufdsc->attr;
-	dfudev->dettmout = le16_to_cpu(dfufdsc->tmout);
-	dfudev->xfersize = le16_to_cpu(dfufdsc->xfersize);
-	dfudev->intf = intf;
-	dfudev->usbdev = interface_to_usbdev(intf);
-	dfudev->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
-	if (dfudev->usbdev->bus->controller->dma_mask)
-		dfudev->dma = 1;
-	else
-		dfudev->dma = 0;
-	mutex_init(&dfudev->dfulock);
-	usb_set_intfdata(intf, dfudev);
-	
-	return retv;
-
-err_10:
-	atomic_dec(&dfu_index);
-	return retv;
-}
-
-static void dfu_cleanup(struct usb_interface *intf, struct dfu_device *dfudev)
-{
-	usb_set_intfdata(intf, NULL);
-	kfree(dfudev);
-	atomic_dec(&dfu_index);
 }
 
 static int dfu_probe(struct usb_interface *intf,
@@ -296,3 +192,176 @@ static void __exit usbdfu_exit(void)
 
 module_init(usbdfu_init);
 module_exit(usbdfu_exit);
+
+int dfu_submit_urb(const struct dfu_device *dfudev,
+		struct dfu_control *ctrl)
+{
+	int retusb, retv, alloc;
+	unsigned long jiff_wait;
+
+	alloc = 0;
+	if (ctrl->urb == NULL) {
+		ctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (!ctrl->urb) {
+			dev_err(&dfudev->intf->dev, "Cannot allocate URB\n");
+			return -ENOMEM;
+		}
+		alloc = 1;
+	}
+	usb_fill_control_urb(ctrl->urb, dfudev->usbdev, ctrl->pipe,
+			(__u8 *)&ctrl->req, ctrl->buff, ctrl->len,
+			dfu_ctrlurb_done, ctrl);
+	init_completion(&ctrl->urbdone);
+	ctrl->status = USB_DFU_ERROR_CODE;
+	retusb = usb_submit_urb(ctrl->urb, GFP_KERNEL);
+	if (retusb == 0) {
+		jiff_wait = msecs_to_jiffies(urb_timeout);
+		if (!wait_for_completion_timeout(&ctrl->urbdone, jiff_wait))
+			dfu_urb_timeout(dfudev, ctrl);
+	} else
+		dev_err(&dfudev->intf->dev,
+			"URB type: %2.2x, req: %2.2x submit failed: %d\n",
+			(int)ctrl->req.bRequestType,
+			(int)ctrl->req.bRequest, retusb);
+	if (alloc) {
+		usb_free_urb(ctrl->urb);
+		ctrl->urb = NULL;
+	}
+	retv = ACCESS_ONCE(ctrl->status);
+	if (retv && ctrl->req.bRequest != USB_DFU_ABORT)
+		dev_err(&dfudev->intf->dev,
+			"URB type: %2.2x, req: %2.2x request failed: %d\n",
+			(int)ctrl->req.bRequestType, (int)ctrl->req.bRequest,
+			ctrl->status);
+
+	return ctrl->status;
+}
+EXPORT_SYMBOL_GPL(dfu_submit_urb);
+
+int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
+			const struct usb_device_id *d)
+{
+	struct dfufdsc *dfufdsc;
+	struct dfu_device *dfudev;
+	int retv, index, dfufdsc_len;
+
+	retv = 0;
+	dfufdsc = (struct dfufdsc *)intf->cur_altsetting->extra;
+	dfufdsc_len = intf->cur_altsetting->extralen;
+	if (!dfufdsc || dfufdsc_len != USB_DFU_FUNC_DSCLEN ||
+			dfufdsc->dsctyp != USB_DFU_FUNC_DSCTYP) {
+		dev_err(&intf->dev, "Invalid DFU functional descriptor\n");
+		return -ENODEV;
+	}
+	index = atomic_inc_return(&dfu_index);
+	if (index >= max_dfus) {
+		retv = -ENODEV;
+		dev_err(&intf->dev, "Maximum supported USB DFU reached: %d\n",
+			max_dfus);
+		goto err_10;
+	}
+
+	*dfudevp = kmalloc(sizeof(struct dfu_device), GFP_KERNEL);
+	if (!*dfudevp) {
+		retv = -ENOMEM;
+		goto err_10;
+	}
+	dfudev = *dfudevp;
+	dfudev->index = index;
+	dfudev->attr = dfufdsc->attr;
+	dfudev->dettmout = le16_to_cpu(dfufdsc->tmout);
+	dfudev->xfersize = le16_to_cpu(dfufdsc->xfersize);
+	dfudev->intf = intf;
+	dfudev->usbdev = interface_to_usbdev(intf);
+	dfudev->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
+	dfudev->devnum = MKDEV(MAJOR(dfu_devnum), index);
+	if (dfudev->usbdev->bus->controller->dma_mask)
+		dfudev->dma = 1;
+	else
+		dfudev->dma = 0;
+	mutex_init(&dfudev->dfulock);
+	usb_set_intfdata(intf, dfudev);
+	
+	return retv;
+
+err_10:
+	atomic_dec(&dfu_index);
+	return retv;
+}
+EXPORT_SYMBOL_GPL(dfu_prepare);
+
+void dfu_cleanup(struct usb_interface *intf, struct dfu_device *dfudev)
+{
+	usb_set_intfdata(intf, NULL);
+	kfree(dfudev);
+	atomic_dec(&dfu_index);
+}
+EXPORT_SYMBOL_GPL(dfu_cleanup);
+
+int dfu_abort(struct dfu_device *dfudev, struct dfu_control *ctrl)
+{
+	ctrl->req.bRequestType = 0x21;
+	ctrl->req.bRequest = USB_DFU_ABORT;
+	ctrl->req.wValue = 0;
+	ctrl->req.wLength = 0;
+	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
+	ctrl->buff = NULL;
+	ctrl->len = 0;
+	ctrl->urb = NULL;
+	return dfu_submit_urb(dfudev, ctrl);
+}
+EXPORT_SYMBOL_GPL(dfu_abort);
+
+int dfu_get_status(const struct dfu_device *dfudev, struct dfu_control *ctrl)
+{
+	int retv;
+
+	ctrl->req.bRequestType = 0xa1;
+	ctrl->req.bRequest = USB_DFU_GETSTATUS;
+	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wValue = 0;
+	ctrl->req.wLength = cpu_to_le16(6);
+	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
+	ctrl->buff = &ctrl->dfuStatus;
+	ctrl->len = 6;
+	ctrl->urb = NULL;
+	retv = dfu_submit_urb(dfudev, ctrl);
+
+	return retv;
+}
+EXPORT_SYMBOL_GPL(dfu_get_status);
+
+int dfu_get_state(const struct dfu_device *dfudev, struct dfu_control *ctrl)
+{
+	int retv;
+
+	ctrl->req.bRequestType = 0xa1;
+	ctrl->req.bRequest = USB_DFU_GETSTATE;
+	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wValue = 0;
+	ctrl->req.wLength = cpu_to_le16(1);
+	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
+	ctrl->buff = &ctrl->dfuState;
+	ctrl->len = 1;
+	ctrl->urb = NULL;
+	retv = dfu_submit_urb(dfudev, ctrl);
+	if (retv == 0)
+		retv = ctrl->dfuState;
+	return retv;
+}
+EXPORT_SYMBOL_GPL(dfu_get_state);
+
+int dfu_clr_status(const struct dfu_device *dfudev, struct dfu_control *ctrl)
+{
+	ctrl->req.bRequestType = 0x21;
+	ctrl->req.bRequest = USB_DFU_CLRSTATUS;
+	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wValue = 0;
+	ctrl->req.wLength = 0;
+	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
+	ctrl->buff = NULL;
+	ctrl->len = 0;
+	ctrl->urb = NULL;
+	return dfu_submit_urb(dfudev, ctrl);
+}
+EXPORT_SYMBOL_GPL(dfu_clr_status);
