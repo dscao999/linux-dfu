@@ -62,18 +62,6 @@ enum dfu_state {
 	dfuERROR = 10
 };
 
-struct dfu_cmd {
-	__u8 cmdata[8];
-} __packed;
-
-struct dfu_info {
-	__le16 blksize;
-	__le16 numblks;
-	__le32 partinfo1;
-	__le32 partinfo0;
-	__le32 addrHigh;
-	__le32 addrLow;
-} __packed;
 
 struct dfu_control {
 	struct urb *urb;
@@ -85,15 +73,9 @@ struct dfu_control {
 	int len;
 	int nxfer;
 	union {
-		unsigned long ocupy;
+		unsigned long ocupy[4];
 		struct dfu_status dfuStatus;
-		struct dfu_cmd cmd;
-		struct dfu_info info;
 		__u8 dfuState;
-		struct {
-			__le16 usMarker;
-			__le16 usVersion;
-		} tiva;
 	};
 };
 

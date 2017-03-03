@@ -203,6 +203,7 @@ static int dfu_prepare(struct dfu_device **dfudevp,
 	else
 		dfudev->dma = 0;
 	mutex_init(&dfudev->dfulock);
+	usb_set_intfdata(intf, dfudev);
 	
 	return retv;
 
@@ -211,29 +212,27 @@ err_10:
 	return retv;
 }
 
-static void dfu_cleanup(struct dfu_device *dfudev)
+static void dfu_cleanup(struct usb_interface *intf, struct dfu_device *dfudev)
 {
-	atomic_dec(&dfu_index);
+	usb_set_intfdata(intf, NULL);
 	kfree(dfudev);
+	atomic_dec(&dfu_index);
 }
 
 static int dfu_probe(struct usb_interface *intf,
 			const struct usb_device_id *id)
 {
 	int retv;
-	struct usb_interface_descriptor *intfdsc;
 	struct dfu_device *dfudev;
 
 	retv = dfu_prepare(&dfudev, intf, id);
-	if (!retv)
+	if (retv)
 		return retv;
 
-	intfdsc = &intf->cur_altsetting->desc;
 	dfudev->actattr.attr.name = "detach";
 	dfudev->actattr.attr.mode = S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH;
 	dfudev->actattr.show = dfu_show;
 	dfudev->actattr.store = dfu_switch;
-	usb_set_intfdata(intf, dfudev);
 	retv = device_create_file(&intf->dev, &dfudev->actattr);
 	if (retv != 0)
 		dev_err(&intf->dev, "Cannot create sysfs file %d\n", retv);
@@ -248,8 +247,7 @@ static void dfu_disconnect(struct usb_interface *intf)
 
 	dfudev = usb_get_intfdata(intf);
 	device_remove_file(&intf->dev, &dfudev->actattr);
-	usb_set_intfdata(intf, NULL);
-	dfu_cleanup(dfudev);
+	dfu_cleanup(intf, dfudev);
 }
 
 static struct usb_driver dfu_driver = {
