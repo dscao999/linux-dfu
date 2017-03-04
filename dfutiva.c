@@ -376,17 +376,23 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	if (!bounce)
 		return -ENOMEM;
 	memcpy(bounce, buf, count);
+	
 	ctrl = bounce + align16;
 	ctrl->req.bRequestType = 0x21;
 	ctrl->req.bRequest = USB_DFU_DNLOAD;
 	ctrl->req.wValue = 0;
 	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 	ctrl->req.wLength = cpu_to_le16(count);
+	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
 	ctrl->buff = bounce;
 	ctrl->len = count;
 	ctrl->urb = NULL;
-	dfu_submit_urb(dfudev, ctrl);
-
+	if (!dfu_submit_urb(dfudev, ctrl)) {
+		dfu_get_status(dfudev, ctrl);
+		dev_info(&dfudev->intf->dev, "Abort status: %d, State: %d\n",
+			(int)ctrl->dfuStatus.bStatus,
+			(int)ctrl->dfuStatus.bState);
+	}
 	kfree(bounce);
 	return count;
 }
