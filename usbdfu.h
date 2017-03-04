@@ -119,11 +119,6 @@ extern struct class *dfu_class;
 int dfu_submit_urb(const struct dfu_device *dfudev, struct dfu_control *ctrl);
 int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
                         const struct usb_device_id *d);
-int dfu_abort(struct dfu_device *dfudev, struct dfu_control *ctrl);
-int dfu_get_status(const struct dfu_device *dfudev, struct dfu_control *ctrl);
-int dfu_get_state(const struct dfu_device *dfudev, struct dfu_control *ctrl);
-int dfu_clr_status(const struct dfu_device *dfudev,
-				struct dfu_control *ctrl);
 void dfu_cleanup(struct usb_interface *intf, struct dfu_device *dfudev);
 
 #endif /* LINUX_USB_DFU_DSCAO__ */
