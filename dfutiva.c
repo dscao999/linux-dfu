@@ -300,7 +300,7 @@ static void dfu_disconnect(struct usb_interface *intf)
 }
 
 static struct usb_driver dfu_driver = {
-	.name = "usbdfu",
+	.name = "dfutiva",
 	.probe = dfu_probe,
 	.disconnect = dfu_disconnect,
 	.id_table = dfu_ids,
