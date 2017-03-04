@@ -47,8 +47,6 @@ static inline int dfu_abort(struct dfu_device *dfudev, struct dfu_control *ctrl)
 static inline int dfu_get_status(const struct dfu_device *dfudev,
 					struct dfu_control *ctrl)
 {
-	int retv;
-
 	ctrl->req.bRequestType = 0xa1;
 	ctrl->req.bRequest = USB_DFU_GETSTATUS;
 	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
@@ -57,9 +55,7 @@ static inline int dfu_get_status(const struct dfu_device *dfudev,
 	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
 	ctrl->buff = &ctrl->dfuStatus;
 	ctrl->len = 6;
-	retv = dfu_submit_urb(dfudev, ctrl);
-
-	return retv;
+	return dfu_submit_urb(dfudev, ctrl);
 }
 
 static inline int dfu_get_state(const struct dfu_device *dfudev,
@@ -147,7 +143,7 @@ static int dfu_release(struct inode *inode, struct file *filp)
 		dfu_clr_status(dfudev, stctrl);
 	else if (retv != dfuIDLE)
 		dfu_abort(dfudev, stctrl);
-	mdelay(100);
+	msleep(100);
 	retv = dfu_get_state(dfudev, stctrl);
 	if (retv != dfuIDLE)
 		dev_err(&dfudev->intf->dev, "Need Reset! Stuck in State: %d\n",
@@ -180,20 +176,13 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 		return -ENOMEM;
 	numb = 0;
 	dfust = dfu_get_state(dfudev, stctrl);
-	if (*f_pos == 0 && dfust != dfuIDLE) {
+	if (*f_pos != 0 && dfust == dfuIDLE)
+		goto exit_10;
+	if ((*f_pos == 0 && dfust != dfuIDLE) ||
+		(*f_pos != 0 && dfust != dfuUPLOAD_IDLE)) {
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
 		numb = -EINVAL;
 		goto exit_10;
-	}
-	if (*f_pos != 0) {
-		if (dfust == dfuIDLE)
-			goto exit_10;
-		if (dfust != dfuUPLOAD_IDLE) {
-			dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n",
-					dfust);
-			numb = -EINVAL;
-			goto exit_10;
-		}
 	}
 	if (!access_ok(VERIFY_WRITE, buff, count)) {
 		numb = -EFAULT;
@@ -217,7 +206,7 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	opctrl->buff = dfudev->databuf;
 	opctrl->len = dfudev->xfersize;
 	if (dfudev->dma) {
-		dmabuf = dma_map_single(ctrler, opctrl->buff, opctrl->len,
+		dmabuf = dma_map_single(ctrler, opctrl->buff, dfudev->xfersize,
 					DMA_FROM_DEVICE);
 		if (!dma_mapping_error(ctrler, dmabuf)) {
 			dma = 1;
@@ -230,7 +219,6 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 
 	blknum = *f_pos / dfudev->xfersize;
 	do {
-		opctrl->nxfer = 0;
 		opctrl->req.wValue = cpu_to_le16(blknum);
 		if (dfu_submit_urb(dfudev, opctrl) ||
 				dfu_get_status(dfudev, stctrl))
@@ -241,8 +229,8 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 				"Uploading failed. DFU State: %d\n", dfust);
 			break;
 		}
-		dma_sync_single_for_cpu(ctrler, dmabuf, opctrl->len, DMA_FROM_DEVICE);
 		len = ACCESS_ONCE(opctrl->nxfer);
+		dma_sync_single_for_cpu(ctrler, dmabuf, len, DMA_FROM_DEVICE);
 		if (copy_to_user(buff+numb, dfudev->databuf, len))
 			break;
 		numb += len;
@@ -251,7 +239,109 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	*f_pos += numb;
 
 	if (dma)
-		dma_unmap_single(ctrler, dmabuf, opctrl->len,
+		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
+				DMA_FROM_DEVICE);
+	usb_free_urb(opctrl->urb);
+
+exit_10:
+	usb_free_urb(stctrl->urb);
+	return numb;
+}
+
+static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
+			size_t count, loff_t *f_pos)
+{
+	struct dfu_device *dfudev;
+	int blknum, numb;
+	struct dfu_control *opctrl, *stctrl;
+	int dfust, dma, len, lenrem, tmout;
+	dma_addr_t dmabuf;
+	struct device *ctrler;
+
+	if (count <= 0)
+		return 0;
+
+	dfudev = filp->private_data;
+	opctrl = dfudev->opctrl;
+	stctrl = dfudev->stctrl;
+	stctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!stctrl->urb)
+		return -ENOMEM;
+	numb = 0;
+	dfust = dfu_get_state(dfudev, stctrl);
+	if ((*f_pos == 0 && dfust != dfuIDLE) ||
+		(*f_pos != 0 && dfust != dfuDNLOAD_IDLE)) {
+		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
+		numb = -EINVAL;
+		goto exit_10;
+	}
+	if (!access_ok(VERIFY_READ, buff, count)) {
+		numb = -EFAULT;
+		goto exit_10;
+	}
+
+	opctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!dfudev->opctrl->urb) {
+		numb = -ENOMEM;
+		goto exit_10;
+	}
+
+	ctrler = dfudev->usbdev->bus->controller;
+	dmabuf = ~0;
+	dma = 0;
+	opctrl->req.bRequestType = 0x21;
+	opctrl->req.bRequest = USB_DFU_DNLOAD;
+	opctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	opctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
+	opctrl->buff = dfudev->databuf;
+	if (dfudev->dma) {
+		dmabuf = dma_map_single(ctrler, opctrl->buff, dfudev->xfersize,
+					DMA_TO_DEVICE);
+		if (!dma_mapping_error(ctrler, dmabuf)) {
+			dma = 1;
+			opctrl->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+			opctrl->urb->transfer_dma = dmabuf;
+		} else
+			dev_warn(&dfudev->intf->dev,
+					"Cannot map DMA address\n");
+	}
+
+	blknum = *f_pos / dfudev->xfersize;
+	lenrem = count;
+	do {
+		opctrl->len = dfudev->xfersize > lenrem ? lenrem :
+							dfudev->xfersize;
+		if (copy_from_user(dfudev->databuf, buff+numb, opctrl->len))
+			break;
+		dma_sync_single_for_device(ctrler, dmabuf, opctrl->len,
+						DMA_TO_DEVICE);
+		opctrl->req.wValue = cpu_to_le16(blknum);
+		opctrl->req.wLength = cpu_to_le16(opctrl->len);
+		if (dfu_submit_urb(dfudev, opctrl) ||
+				dfu_get_status(dfudev, stctrl))
+			break;
+		len = ACCESS_ONCE(opctrl->nxfer);
+		numb += len;
+		lenrem -= len;
+		blknum++;
+		while (stctrl->dfuStatus.bState == dfuDNLOAD_BUSY) {
+			tmout = stctrl->dfuStatus.wmsec[0] |
+					(stctrl->dfuStatus.wmsec[1] << 8) |
+					(stctrl->dfuStatus.wmsec[2] << 16);
+			msleep(tmout);
+			if (dfu_get_status(dfudev, stctrl))
+				break;
+		}
+		if (stctrl->dfuStatus.bState != dfuDNLOAD_IDLE) {
+			dev_err(&dfudev->intf->dev,
+				"Uploading failed. DFU State: %d\n", dfust);
+			break;
+		}
+	} while (len == opctrl->len && lenrem > 0);
+	*f_pos += numb;
+
+	if (dma)
+		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
 				DMA_FROM_DEVICE);
 	usb_free_urb(opctrl->urb);
 
@@ -265,7 +355,7 @@ static const struct file_operations dfu_fops = {
 	.open		= dfu_open,
 	.release	= dfu_release,
 	.read		= dfu_upload,
-	.write		= NULL, /*dfu_download,*/
+	.write		= dfu_dnload
 };
 
 static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
