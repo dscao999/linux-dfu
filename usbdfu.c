@@ -87,7 +87,7 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	struct dfu_device *dfudev;
 	struct dfu_control *ctrl;
 
-	dfudev = container_of(attr, struct dfu_device, actattr);
+	dfudev = container_of(attr, struct dfu_device, tachattr);
 	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
 	if (!ctrl)
 		return -ENOMEM;
@@ -101,18 +101,91 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static ssize_t dfu_show(struct device *dev, struct device_attribute *attr,
-			char *buf)
+static ssize_t dfu_attr_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
 {
 	struct dfu_device *dfudev;
-	int retv;
-	const char *fmt = "Attribute: %#02.2x Timeout: %d Transfer Size: %d\n";
 
-	retv = 0;
-	dfudev = container_of(attr, struct dfu_device, actattr);
-	retv = snprintf(buf, 128, fmt, dfudev->attr, dfudev->dettmout,
-			dfudev->xfersize);
+	dfudev = container_of(attr, struct dfu_device, attrattr);
+	return sprintf(buf, "%2.2X\n", dfudev->attr);
+}
+
+static ssize_t dfu_timeout_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct dfu_device *dfudev;
+
+	dfudev = container_of(attr, struct dfu_device, tmoutattr);
+	return sprintf(buf, "%d\n", dfudev->dettmout);
+}
+
+static ssize_t dfu_xfersize_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct dfu_device *dfudev;
+
+	dfudev = container_of(attr, struct dfu_device, xsizeattr);
+	return sprintf(buf, "%d\n", dfudev->xfersize);
+}
+
+static int dfu_create_attrs(struct dfu_device *dfudev)
+{
+	int retv = 0;
+
+	dfudev->tachattr.attr.name = "detach";
+	dfudev->tachattr.attr.mode = S_IWUSR;
+	dfudev->tachattr.show = NULL;
+	dfudev->tachattr.store = dfu_switch;
+	retv = device_create_file(&dfudev->intf->dev, &dfudev->tachattr);
+	if (retv != 0) {
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		return retv;
+	}
+	dfudev->attrattr.attr.name = "attr";
+	dfudev->attrattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->attrattr.show = dfu_attr_show;
+	dfudev->attrattr.store = NULL;
+	retv = device_create_file(&dfudev->intf->dev, &dfudev->attrattr);
+	if (retv != 0) {
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		goto err_10;
+	}
+	dfudev->tmoutattr.attr.name = "timeout";
+	dfudev->tmoutattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->tmoutattr.show = dfu_timeout_show;
+	dfudev->tmoutattr.store = NULL;
+	retv = device_create_file(&dfudev->intf->dev, &dfudev->tmoutattr);
+	if (retv != 0) {
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		goto err_20;
+	}
+	dfudev->xsizeattr.attr.name = "xfersize";
+	dfudev->xsizeattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->xsizeattr.show = dfu_xfersize_show;
+	dfudev->xsizeattr.store = NULL;
+	retv = device_create_file(&dfudev->intf->dev, &dfudev->xsizeattr);
+	if (retv != 0) {
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		goto err_30;
+	}
+
 	return retv;
+
+err_30:
+	device_remove_file(&dfudev->intf->dev, &dfudev->tmoutattr);
+err_20:
+	device_remove_file(&dfudev->intf->dev, &dfudev->attrattr);
+err_10:
+	device_remove_file(&dfudev->intf->dev, &dfudev->tachattr);
+	return retv;
+}
+
+static void dfu_remove_attrs(struct dfu_device *dfudev)
+{
+	device_remove_file(&dfudev->intf->dev, &dfudev->xsizeattr);
+	device_remove_file(&dfudev->intf->dev, &dfudev->tmoutattr);
+	device_remove_file(&dfudev->intf->dev, &dfudev->attrattr);
+	device_remove_file(&dfudev->intf->dev, &dfudev->tachattr);
 }
 
 static int dfu_probe(struct usb_interface *intf,
@@ -125,15 +198,10 @@ static int dfu_probe(struct usb_interface *intf,
 	if (retv)
 		return retv;
 
-	dfudev->actattr.attr.name = "detach";
-	dfudev->actattr.attr.mode = S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH;
-	dfudev->actattr.show = dfu_show;
-	dfudev->actattr.store = dfu_switch;
-	retv = device_create_file(&intf->dev, &dfudev->actattr);
-	if (retv != 0)
-		dev_err(&intf->dev, "Cannot create sysfs file %d\n", retv);
 	dfudev->proto = 1;
-
+	retv = dfu_create_attrs(dfudev);
+	if (retv)
+		dfu_cleanup(dfudev);
 	return retv;
 }
 
@@ -142,8 +210,8 @@ static void dfu_disconnect(struct usb_interface *intf)
 	struct dfu_device *dfudev;
 
 	dfudev = usb_get_intfdata(intf);
-	device_remove_file(&intf->dev, &dfudev->actattr);
-	dfu_cleanup(intf, dfudev);
+	dfu_remove_attrs(dfudev);
+	dfu_cleanup(dfudev);
 }
 
 static struct usb_driver dfu_driver = {
@@ -290,11 +358,10 @@ err_10:
 }
 EXPORT_SYMBOL_GPL(dfu_prepare);
 
-void dfu_cleanup(struct usb_interface *intf, struct dfu_device *dfudev)
+void dfu_cleanup(struct dfu_device *dfudev)
 {
-	usb_set_intfdata(intf, NULL);
+	usb_set_intfdata(dfudev->intf, NULL);
 	kfree(dfudev);
 	atomic_dec(&dfu_index);
 }
 EXPORT_SYMBOL_GPL(dfu_cleanup);
-

@@ -93,8 +93,11 @@ struct dfu_device {
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
 	struct device *sysdev;
-	struct device_attribute actattr;
-	struct device_attribute dfuattr;
+	struct device_attribute tachattr;
+	struct device_attribute attrattr;
+	struct device_attribute tmoutattr;
+	struct device_attribute xsizeattr;
+	struct device_attribute statattr;
 	dev_t devnum;
 	void *databuf;
 	struct dfu_control *opctrl, *stctrl;
@@ -105,13 +108,7 @@ struct dfu_device {
 	int xfersize;
 	int proto;
 	int intfnum;
-
 	struct cdev dfu_cdev;
-
-	union {
-		int feat;
-		struct dfu_feature ftus;
-	};
 };
 
 extern struct class *dfu_class;
@@ -119,6 +116,6 @@ extern struct class *dfu_class;
 int dfu_submit_urb(const struct dfu_device *dfudev, struct dfu_control *ctrl);
 int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
                         const struct usb_device_id *d);
-void dfu_cleanup(struct usb_interface *intf, struct dfu_device *dfudev);
+void dfu_cleanup(struct dfu_device *dfudev);
 
 #endif /* LINUX_USB_DFU_DSCAO__ */
