@@ -36,6 +36,7 @@ static inline int dfu_abort(struct dfu_device *dfudev, struct dfu_control *ctrl)
 {
 	ctrl->req.bRequestType = 0x21;
 	ctrl->req.bRequest = USB_DFU_ABORT;
+	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 	ctrl->req.wValue = 0;
 	ctrl->req.wLength = 0;
 	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
@@ -366,8 +367,8 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	void *bounce;
 	int align16;
 
-	if (count == 0)
-		return 0;
+	if (count < 4 || count > 32)
+		return count;
 
 	dfudev = container_of(attr, struct dfu_device, tachattr);
 	align16 = ((count-1)/16 + 1)*16;
@@ -434,6 +435,22 @@ static ssize_t dfu_state_show(struct device *dev, struct device_attribute *attr,
 	return sprintf(buf, "%d\n", dfstat);
 }
 
+static ssize_t dfu_abort_cmd(struct device *dev, struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+	struct dfu_device *dfudev;
+	struct dfu_control *ctrl;
+
+	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
+	if (!ctrl)
+		return 0;
+	dfudev = container_of(attr, struct dfu_device, abortattr);
+	ctrl->urb = NULL;
+	dfu_abort(dfudev, ctrl);
+	kfree(ctrl);
+	return count;
+}
+
 static int dfu_create_attrs(struct dfu_device *dfudev)
 {
 	int retv = 0;
@@ -483,9 +500,20 @@ static int dfu_create_attrs(struct dfu_device *dfudev)
 		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
 		goto err_40;
 	}
+	dfudev->abortattr.attr.name = "abort";
+	dfudev->abortattr.attr.mode = S_IWUSR;
+	dfudev->abortattr.store = dfu_abort_cmd;
+	dfudev->abortattr.show = NULL;
+	retv = device_create_file(&dfudev->intf->dev, &dfudev->abortattr);
+	if (retv != 0) {
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		goto err_50;
+	}
 
 	return retv;
 
+err_50:
+	device_remove_file(&dfudev->intf->dev, &dfudev->statattr);
 err_40:
 	device_remove_file(&dfudev->intf->dev, &dfudev->xsizeattr);
 err_30:
@@ -499,6 +527,7 @@ err_10:
 
 static void dfu_remove_attrs(struct dfu_device *dfudev)
 {
+	device_remove_file(&dfudev->intf->dev, &dfudev->abortattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->statattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->xsizeattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->tmoutattr);

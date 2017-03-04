@@ -98,6 +98,7 @@ struct dfu_device {
 	struct device_attribute tmoutattr;
 	struct device_attribute xsizeattr;
 	struct device_attribute statattr;
+	struct device_attribute abortattr;
 	dev_t devnum;
 	void *databuf;
 	struct dfu_control *opctrl, *stctrl;
