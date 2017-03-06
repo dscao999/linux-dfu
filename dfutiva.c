@@ -168,8 +168,6 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 		return 0;
 
 	dfudev = filp->private_data;
-	if (count % dfudev->xfersize != 0)
-		return -EINVAL;
 	opctrl = dfudev->opctrl;
 	stctrl = dfudev->stctrl;
 	stctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
@@ -389,7 +387,7 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	ctrl->urb = NULL;
 	if (!dfu_submit_urb(dfudev, ctrl)) {
 		dfu_get_status(dfudev, ctrl);
-		dev_info(&dfudev->intf->dev, "Abort status: %d, State: %d\n",
+		dev_info(&dfudev->intf->dev, "Switch status: %d, State: %d\n",
 			(int)ctrl->dfuStatus.bStatus,
 			(int)ctrl->dfuStatus.bState);
 	}
@@ -441,18 +439,32 @@ static ssize_t dfu_state_show(struct device *dev, struct device_attribute *attr,
 	return sprintf(buf, "%d\n", dfstat);
 }
 
-static ssize_t dfu_abort_cmd(struct device *dev, struct device_attribute *attr,
+static ssize_t dfu_clear_cmd(struct device *dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
 	struct dfu_device *dfudev;
 	struct dfu_control *ctrl;
+	int dfust;
 
 	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
 	if (!ctrl)
 		return 0;
 	dfudev = container_of(attr, struct dfu_device, abortattr);
 	ctrl->urb = NULL;
-	dfu_abort(dfudev, ctrl);
+	dfust = dfu_get_state(dfudev, ctrl);
+	switch (dfust) {
+	case dfuDNLOAD_IDLE:
+	case dfuUPLOAD_IDLE:
+		dfu_abort(dfudev, ctrl);
+		break;
+	case dfuERROR:
+		dfu_clr_status(dfudev, ctrl);
+		break;
+	default:
+		dev_warn(&dfudev->intf->dev, "Cannot clear, in state: %d\n",
+				dfust);
+		break;
+	}
 	kfree(ctrl);
 	return count;
 }
@@ -506,9 +518,9 @@ static int dfu_create_attrs(struct dfu_device *dfudev)
 		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
 		goto err_40;
 	}
-	dfudev->abortattr.attr.name = "abort";
+	dfudev->abortattr.attr.name = "clear";
 	dfudev->abortattr.attr.mode = S_IWUSR;
-	dfudev->abortattr.store = dfu_abort_cmd;
+	dfudev->abortattr.store = dfu_clear_cmd;
 	dfudev->abortattr.show = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->abortattr);
 	if (retv != 0) {
