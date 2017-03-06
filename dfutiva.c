@@ -92,6 +92,20 @@ static inline int dfu_clr_status(const struct dfu_device *dfudev,
 	return dfu_submit_urb(dfudev, ctrl);
 }
 
+static inline int dfu_finish_dnload(const struct dfu_device *dfudev,
+					struct dfu_control *ctrl)
+{
+	ctrl->req.bRequestType = 0x21;
+	ctrl->req.bRequest = USB_DFU_DNLOAD;
+	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wValue = 0;
+	ctrl->req.wLength = 0;
+	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
+	ctrl->buff = NULL;
+	ctrl->len = 0;
+	return dfu_submit_urb(dfudev, ctrl);
+}
+
 static int dfu_open(struct inode *inode, struct file *filp)
 {
 	struct dfu_device *dfudev;
@@ -140,7 +154,9 @@ static int dfu_release(struct inode *inode, struct file *filp)
 	stctrl = dfudev->stctrl;
 	stctrl->urb = NULL;
 	retv = dfu_get_state(dfudev, stctrl);
-	if (retv == dfuERROR)
+	if (retv == dfuDNLOAD_IDLE)
+		dfu_finish_dnload(dfudev, stctrl);
+	else if (retv == dfuERROR)
 		dfu_clr_status(dfudev, stctrl);
 	else if (retv != dfuIDLE)
 		dfu_abort(dfudev, stctrl);
@@ -180,11 +196,13 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 		numb = -EINVAL;
 		goto exit_10;
 	}
+	if (*f_pos != 0 && dfust == dfuIDLE)
+		return 0;
+
 	if (!access_ok(VERIFY_WRITE, buff, count)) {
 		numb = -EFAULT;
 		goto exit_10;
 	}
-
 	opctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!dfudev->opctrl->urb) {
 		numb = -ENOMEM;
@@ -232,7 +250,8 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 		numb += len;
 		blknum++;
 	} while (len == opctrl->len && numb < count);
-	*f_pos += numb;
+	if (*f_pos != 0 || numb > 32)
+		*f_pos += numb;
 
 	if (dma)
 		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
@@ -334,7 +353,8 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 			break;
 		}
 	} while (len == opctrl->len && lenrem > 0);
-	*f_pos += numb;
+	if (*f_pos != 0 || numb > 32)
+ 		*f_pos += numb;
 
 	if (dma)
 		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
