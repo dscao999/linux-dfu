@@ -175,10 +175,7 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 		return -ENOMEM;
 	numb = 0;
 	dfust = dfu_get_state(dfudev, stctrl);
-	if (*f_pos != 0 && dfust == dfuIDLE)
-		goto exit_10;
-	if ((*f_pos == 0 && dfust != dfuIDLE) ||
-		(*f_pos != 0 && dfust != dfuUPLOAD_IDLE)) {
+	if (dfust != dfuIDLE && dfust != dfuUPLOAD_IDLE) {
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
 		numb = -EINVAL;
 		goto exit_10;
@@ -268,8 +265,7 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 		return -ENOMEM;
 	numb = 0;
 	dfust = dfu_get_state(dfudev, stctrl);
-	if ((*f_pos == 0 && dfust != dfuIDLE) ||
-		(*f_pos != 0 && dfust != dfuDNLOAD_IDLE)) {
+	if (dfust != dfuIDLE && dfust != dfuDNLOAD_IDLE) {
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
 		numb = -EINVAL;
 		goto exit_10;
@@ -331,9 +327,10 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 			if (dfu_get_status(dfudev, stctrl))
 				break;
 		}
-		if (stctrl->dfuStatus.bState != dfuDNLOAD_IDLE) {
+		if (stctrl->dfuStatus.bState != dfuDNLOAD_IDLE &&
+		    stctrl->dfuStatus.bState != dfuIDLE) {
 			dev_err(&dfudev->intf->dev,
-				"Uploading failed. DFU State: %d\n", dfust);
+				"Downloading failed. DFU State: %d\n", dfust);
 			break;
 		}
 	} while (len == opctrl->len && lenrem > 0);
@@ -357,7 +354,7 @@ static const struct file_operations dfu_fops = {
 	.write		= dfu_dnload
 };
 
-static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
+static ssize_t dfu_sndcmd(struct device *dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
 	struct dfu_device *dfudev;
@@ -369,7 +366,12 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 		return count;
 
 	dfudev = container_of(attr, struct dfu_device, tachattr);
-	align16 = ((count-1)/16 + 1)*16;
+	if (!mutex_trylock(&dfudev->dfulock)) {
+		dev_err(&dfudev->intf->dev,
+				"Cannot send command, device busy\n");
+		return count;
+	}
+	align16 = (((count-1) >> 4) + 1) << 4;
 	bounce = kmalloc(sizeof(struct dfu_control)+align16, GFP_KERNEL);
 	if (!bounce)
 		return -ENOMEM;
@@ -385,13 +387,18 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 	ctrl->buff = bounce;
 	ctrl->len = count;
 	ctrl->urb = NULL;
-	if (!dfu_submit_urb(dfudev, ctrl)) {
-		dfu_get_status(dfudev, ctrl);
-		dev_info(&dfudev->intf->dev, "Switch status: %d, State: %d\n",
-			(int)ctrl->dfuStatus.bStatus,
-			(int)ctrl->dfuStatus.bState);
-	}
+	if (dfu_submit_urb(dfudev, ctrl) || dfu_get_status(dfudev, ctrl))
+		dev_err(&dfudev->intf->dev,
+				"DFU command failed: %d, State: %d\n",
+				(int)ctrl->dfuStatus.bStatus,
+				(int)ctrl->dfuStatus.bState);
+	else
+		dev_info(&dfudev->intf->dev,
+				"DFU commmand status: %d, State: %d\n",
+				(int)ctrl->dfuStatus.bStatus,
+				(int)ctrl->dfuStatus.bState);
 	kfree(bounce);
+	mutex_unlock(&dfudev->dfulock);
 	return count;
 }
 
@@ -473,10 +480,10 @@ static int dfu_create_attrs(struct dfu_device *dfudev)
 {
 	int retv = 0;
 
-	dfudev->tachattr.attr.name = "attach";
+	dfudev->tachattr.attr.name = "dfucmd";
 	dfudev->tachattr.attr.mode = S_IWUSR;
 	dfudev->tachattr.show = NULL;
-	dfudev->tachattr.store = dfu_switch;
+	dfudev->tachattr.store = dfu_sndcmd;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->tachattr);
 	if (retv != 0) {
 		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
