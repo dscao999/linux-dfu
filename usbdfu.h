@@ -104,7 +104,12 @@ struct dfu_device {
 	struct dfu_control *opctrl, *stctrl;
 	int dma;
 	int index;
-	int attr;
+	struct {
+		unsigned int download:1;
+		unsigned int upload:1;
+		unsigned int manifest:1;
+		unsigned int detach:1;
+	};
 	int dettmout;
 	int xfersize;
 	int proto;

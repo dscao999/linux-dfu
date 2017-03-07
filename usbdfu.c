@@ -76,7 +76,7 @@ static int dfu_do_switch(struct dfu_device *dfudev, struct dfu_control *ctrl)
 	ctrl->len = 0;
 	ctrl->urb = NULL;
 	retusb = dfu_submit_urb(dfudev, ctrl);
-	if (retusb == 0 && (dfudev->attr & 0x08) == 0)
+	if (retusb == 0 && dfudev->detach == 0)
 		dev_info(&dfudev->intf->dev, "Need reset to switch to DFU\n");
 	return retusb;
 }
@@ -107,7 +107,9 @@ static ssize_t dfu_attr_show(struct device *dev, struct device_attribute *attr,
 	struct dfu_device *dfudev;
 
 	dfudev = container_of(attr, struct dfu_device, attrattr);
-	return sprintf(buf, "%2.2X\n", dfudev->attr);
+	return sprintf(buf, "Download:%d Upload:%d Manifest:%d Detach:%d\n",
+		dfudev->download, dfudev->upload, dfudev->manifest,
+		dfudev->detach);
 }
 
 static ssize_t dfu_timeout_show(struct device *dev,
@@ -336,7 +338,10 @@ int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
 	}
 	dfudev = *dfudevp;
 	dfudev->index = index;
-	dfudev->attr = dfufdsc->attr;
+	dfudev->download = (dfufdsc->attr & 0x01) ? 1 : 0;
+	dfudev->upload = (dfufdsc->attr & 0x02) ? 1 : 0;
+	dfudev->manifest = (dfufdsc->attr & 0x04) ? 1 : 0;
+	dfudev->detach = (dfufdsc->attr & 0x08) ? 1 : 0;
 	dfudev->dettmout = le16_to_cpu(dfufdsc->tmout);
 	dfudev->xfersize = le16_to_cpu(dfufdsc->xfersize);
 	dfudev->intf = intf;

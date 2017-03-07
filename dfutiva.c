@@ -428,7 +428,9 @@ static ssize_t dfu_attr_show(struct device *dev, struct device_attribute *attr,
 	struct dfu_device *dfudev;
 
 	dfudev = container_of(attr, struct dfu_device, attrattr);
-	return sprintf(buf, "%2.2X\n", dfudev->attr);
+	return sprintf(buf, "Download:%d Upload:%d Manifest:%d Detach:%d\n",
+		dfudev->download, dfudev->upload, dfudev->manifest,
+		dfudev->detach);
 }
 
 static ssize_t dfu_timeout_show(struct device *dev, struct device_attribute *attr,
