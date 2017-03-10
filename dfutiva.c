@@ -468,6 +468,57 @@ static ssize_t dfu_state_show(struct device *dev, struct device_attribute *attr,
 	return sprintf(buf, "%d\n", dfstat);
 }
 
+static ssize_t stellaris_show(struct dfu_device *dfudev,
+			struct dfu_control *ctrl, char *buf)
+{
+	struct {
+		unsigned short usMarker;
+		unsigned short usVersion;
+	} stellaris;
+	unsigned short usMarker, usVersion;
+	int num = 0;
+
+	ctrl->req.bRequest = 0x42; /* Request Stellaris */
+	ctrl->req.bRequestType = 0xa1;
+	ctrl->req.wValue = 0x23;
+	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wLength = 4;
+	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
+	ctrl->buff = &stellaris;
+	ctrl->len = sizeof(stellaris);
+	if (dfu_submit_urb(dfudev, ctrl) == 0) {
+		usMarker = le16_to_cpu(stellaris.usMarker);
+		usVersion = le16_to_cpu(stellaris.usVersion);
+		num = sprintf(buf, "Stellaris Marker: %4.4X, Version: %4.4X\n",
+			usMarker, usVersion);
+	}
+	return num;
+}
+
+static ssize_t dfu_query_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct dfu_device *dfudev;
+	struct dfu_control *ctrl;
+	unsigned short idVendor, idProduct;
+	ssize_t numbytes;
+
+	dfudev = container_of(attr, struct dfu_device, queryattr);
+	idVendor = le16_to_cpu(dfudev->usbdev->descriptor.idVendor);
+	idProduct = le16_to_cpu(dfudev->usbdev->descriptor.idProduct);
+	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
+	if (!ctrl)
+		return 0;
+	ctrl->urb = NULL;
+	numbytes = 0;
+	if (idVendor == USB_VENDOR_LUMINARY &&
+	    idProduct == USB_PRODUCT_STELLARIS_DFU)
+		numbytes = stellaris_show(dfudev, ctrl, buf);
+
+	kfree(ctrl);
+	return numbytes;
+}
+
 static ssize_t dfu_clear_cmd(struct device *dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
@@ -556,8 +607,19 @@ static int dfu_create_attrs(struct dfu_device *dfudev)
 		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
 		goto err_50;
 	}
+	dfudev->queryattr.attr.name = "query";
+	dfudev->queryattr.attr.mode =  S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->queryattr.show = dfu_query_show;
+	dfudev->queryattr.store = NULL;
+	retv = device_create_file(&dfudev->intf->dev, &dfudev->queryattr);
+	if (retv != 0) {
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		goto err_60;
+	}
 
 	return retv;
+err_60:
+	device_remove_file(&dfudev->intf->dev, &dfudev->abortattr);
 
 err_50:
 	device_remove_file(&dfudev->intf->dev, &dfudev->statattr);
