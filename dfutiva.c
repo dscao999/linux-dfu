@@ -668,8 +668,8 @@ static int dfu_probe(struct usb_interface *intf,
 		dev_err(&dfudev->intf->dev, "Cannot add device: %d\n", retv);
 		goto err_20;
 	}
-	dfudev->sysdev = device_create(dfu_class, &intf->dev,
-			dfudev->devnum, dfudev, DFUDEV_NAME"%d", dfudev->index);
+	dfudev->sysdev = device_create(dfu_class, &intf->dev, dfudev->devnum,
+				dfudev, DFUDEV_NAME"%d", MINOR(dfudev->devnum));
 	if (IS_ERR(dfudev->sysdev)) {
 		retv = (int)PTR_ERR(dfudev->sysdev);
 		dev_err(&dfudev->intf->dev, "Cannot create device file: %d\n",
