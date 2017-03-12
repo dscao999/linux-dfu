@@ -471,10 +471,10 @@ static ssize_t dfu_state_show(struct device *dev, struct device_attribute *attr,
 static ssize_t stellaris_show(struct dfu_device *dfudev,
 			struct dfu_control *ctrl, char *buf)
 {
-	struct {
+	struct tidfu {
 		unsigned short usMarker;
 		unsigned short usVersion;
-	} stellaris;
+	} *stellaris;
 	unsigned short usMarker, usVersion;
 	int num = 0;
 
@@ -484,11 +484,12 @@ static ssize_t stellaris_show(struct dfu_device *dfudev,
 	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 	ctrl->req.wLength = 4;
 	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = &stellaris;
-	ctrl->len = sizeof(stellaris);
+	ctrl->buff = ctrl->ocupy;
+	ctrl->len = sizeof(struct tidfu);
+	stellaris = ctrl->buff;
 	if (dfu_submit_urb(dfudev, ctrl) == 0) {
-		usMarker = le16_to_cpu(stellaris.usMarker);
-		usVersion = le16_to_cpu(stellaris.usVersion);
+		usMarker = le16_to_cpu(stellaris->usMarker);
+		usVersion = le16_to_cpu(stellaris->usVersion);
 		num = sprintf(buf, "Stellaris Marker: %4.4X, Version: %4.4X\n",
 			usMarker, usVersion);
 	}
@@ -618,9 +619,9 @@ static int dfu_create_attrs(struct dfu_device *dfudev)
 	}
 
 	return retv;
+
 err_60:
 	device_remove_file(&dfudev->intf->dev, &dfudev->abortattr);
-
 err_50:
 	device_remove_file(&dfudev->intf->dev, &dfudev->statattr);
 err_40:
@@ -636,6 +637,7 @@ err_10:
 
 static void dfu_remove_attrs(struct dfu_device *dfudev)
 {
+	device_remove_file(&dfudev->intf->dev, &dfudev->queryattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->abortattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->statattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->xsizeattr);

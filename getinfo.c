@@ -45,6 +45,11 @@ int main(int argc, char *argv[])
 	printf("Result read: %d. Look at the state\n", numb);
 	scanf("%s", resp);
 
+	printf("block size: %d, number of blocks: %d, Part Info: %8.8X, Class Info: %8.8X, Top: %8.8X, Start: %8.8X\n",
+		(int)dinfo.usFlashBlockSize, (int)dinfo.usNumFlashBlocks,
+		dinfo.ulPartInfo, dinfo.ulClassInfo,
+		dinfo.ulFlashTop, dinfo.ulAppStartAddr);
+
 	close(dfuh);
 	return 0;
 }
