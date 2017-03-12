@@ -37,6 +37,7 @@ struct class *dfu_class;
 EXPORT_SYMBOL_GPL(dfu_class);
 
 static atomic_t dfu_index = ATOMIC_INIT(-1);
+static atomic_t *dev_minors;
 
 static void dfu_ctrlurb_done(struct urb *urb)
 {
@@ -225,7 +226,7 @@ static struct usb_driver dfu_driver = {
 
 static int __init usbdfu_init(void)
 {
-	int retv;
+	int retv, i;
 
 	retv = alloc_chrdev_region(&dfu_devnum, 0, max_dfus, DFUDEV_NAME);
 	if (retv != 0) {
@@ -243,9 +244,19 @@ static int __init usbdfu_init(void)
 		pr_err("Cannot register USB DFU driver: %d\n", retv);
 		goto err_20;
 	}
+	dev_minors = kmalloc(sizeof(atomic_t)*max_dfus, GFP_KERNEL);
+	if (!dev_minors) {
+		retv = -ENOMEM;
+		pr_err("Cannot allocate minor talbe, Out of Memory\n");
+		goto err_30;
+	}
+	for (i = 0; i < max_dfus; i++)
+		atomic_set(dev_minors+i, 0);
 
 	return retv;
 
+err_30:
+	usb_deregister(&dfu_driver);
 err_20:
 	class_destroy(dfu_class);
 err_10:
@@ -255,6 +266,7 @@ err_10:
 
 static void __exit usbdfu_exit(void)
 {
+	kfree(dev_minors);
 	usb_deregister(&dfu_driver);
 	class_destroy(dfu_class);
 	unregister_chrdev_region(dfu_devnum, max_dfus);
@@ -313,7 +325,7 @@ int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
 {
 	struct dfufdsc *dfufdsc;
 	struct dfu_device *dfudev;
-	int retv, index, dfufdsc_len;
+	int retv, index, dfufdsc_len, i;
 
 	retv = 0;
 	dfufdsc = (struct dfufdsc *)intf->cur_altsetting->extra;
@@ -324,7 +336,7 @@ int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
 		return -ENODEV;
 	}
 	index = atomic_inc_return(&dfu_index);
-	if (index >= max_dfus) {
+	if (!(index < max_dfus)) {
 		retv = -ENODEV;
 		dev_err(&intf->dev, "Maximum supported USB DFU reached: %d\n",
 			max_dfus);
@@ -347,13 +359,16 @@ int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
 	dfudev->intf = intf;
 	dfudev->usbdev = interface_to_usbdev(intf);
 	dfudev->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
-	dfudev->devnum = MKDEV(MAJOR(dfu_devnum), index);
 	if (dfudev->usbdev->bus->controller->dma_mask)
 		dfudev->dma = 1;
 	else
 		dfudev->dma = 0;
 	mutex_init(&dfudev->dfulock);
 	usb_set_intfdata(intf, dfudev);
+	for (i = 0; i < max_dfus; i++)
+		if (!atomic_xchg(dev_minors+i, 1))
+			break;
+	dfudev->devnum = MKDEV(MAJOR(dfu_devnum), i);
 	
 	return retv;
 
@@ -365,6 +380,10 @@ EXPORT_SYMBOL_GPL(dfu_prepare);
 
 void dfu_cleanup(struct dfu_device *dfudev)
 {
+	int minor;
+
+	minor = MINOR(dfudev->devnum);
+	atomic_set(dev_minors+minor, 0);
 	usb_set_intfdata(dfudev->intf, NULL);
 	kfree(dfudev);
 	atomic_dec(&dfu_index);
