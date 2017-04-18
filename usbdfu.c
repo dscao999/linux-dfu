@@ -5,13 +5,13 @@
  *
  * USB Abstract Control Model driver for USB Device Firmware Upgrade
  *
-*/
+ */
 #include <stdarg.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include "usbdfu.h"
 
 MODULE_LICENSE("GPL");
@@ -19,11 +19,11 @@ MODULE_AUTHOR("Dashi Cao");
 MODULE_DESCRIPTION("USB DFU Class Driver");
 
 static int max_dfus = 8;
-module_param(max_dfus, int, S_IRUGO);
+module_param(max_dfus, int, 0644);
 static int urb_timeout = 200; /* milliseconds */
-module_param(urb_timeout, int, S_IRUGO | S_IWUSR);
+module_param(urb_timeout, int, 0644);
 static int detach_timeout = 2000; /* 2 seconds */
-module_param(detach_timeout, int, S_IRUGO | S_IWUSR);
+module_param(detach_timeout, int, 0644);
 
 static const struct usb_device_id dfu_ids[] = {
 	{ USB_INTERFACE_INFO(USB_CLASS_APP_SPEC, USB_DFU_SUBCLASS,
@@ -136,39 +136,43 @@ static int dfu_create_attrs(struct dfu_device *dfudev)
 	int retv = 0;
 
 	dfudev->tachattr.attr.name = "detach";
-	dfudev->tachattr.attr.mode = S_IWUSR;
+	dfudev->tachattr.attr.mode = 0200;
 	dfudev->tachattr.show = NULL;
 	dfudev->tachattr.store = dfu_switch;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->tachattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		return retv;
 	}
 	dfudev->attrattr.attr.name = "attr";
-	dfudev->attrattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->attrattr.attr.mode = 0444;
 	dfudev->attrattr.show = dfu_attr_show;
 	dfudev->attrattr.store = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->attrattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_10;
 	}
 	dfudev->tmoutattr.attr.name = "timeout";
-	dfudev->tmoutattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->tmoutattr.attr.mode = 0444;
 	dfudev->tmoutattr.show = dfu_timeout_show;
 	dfudev->tmoutattr.store = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->tmoutattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_20;
 	}
 	dfudev->xsizeattr.attr.name = "xfersize";
-	dfudev->xsizeattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->xsizeattr.attr.mode = 0444;
 	dfudev->xsizeattr.show = dfu_xfersize_show;
 	dfudev->xsizeattr.store = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->xsizeattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_30;
 	}
 
@@ -239,7 +243,7 @@ static int __init usbdfu_init(void)
 		pr_err("Cannot create DFU class, Out of Memory!\n");
 		goto err_10;
 	}
-	dev_minors = kmalloc(sizeof(atomic_t)*max_dfus, GFP_KERNEL);
+	dev_minors = kmalloc_array(max_dfus, sizeof(atomic_t), GFP_KERNEL);
 	if (!dev_minors) {
 		retv = -ENOMEM;
 		pr_err("Cannot allocate minor talbe, Out of Memory\n");
@@ -309,7 +313,7 @@ int dfu_submit_urb(const struct dfu_device *dfudev,
 		usb_free_urb(ctrl->urb);
 		ctrl->urb = NULL;
 	}
-	retv = ACCESS_ONCE(ctrl->status);
+	retv = READ_ONCE(ctrl->status);
 	if (retv && ctrl->req.bRequest != USB_DFU_ABORT)
 		dev_err(&dfudev->intf->dev,
 			"URB type: %2.2x, req: %2.2x request failed: %d\n",
@@ -369,7 +373,7 @@ int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
 			break;
 	dfudev->devnum = MKDEV(MAJOR(dfu_devnum), i);
 	usb_set_intfdata(intf, dfudev);
-	
+
 	return retv;
 
 err_10:

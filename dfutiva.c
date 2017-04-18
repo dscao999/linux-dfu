@@ -5,7 +5,7 @@
  *
  * USB Device Firmware Upgrade support for TI Tiva C series
  *
-*/
+ */
 #include <stdarg.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -15,7 +15,7 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/dma-mapping.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include "usbdfu.h"
 
 MODULE_LICENSE("GPL");
@@ -27,7 +27,7 @@ MODULE_DESCRIPTION("Tiva C USB DFU Driver");
 
 static const struct usb_device_id dfu_ids[] = {
 	{ USB_DFU_INTERFACE_INFO(USB_VENDOR_LUMINARY,
-	  	USB_CLASS_APP_SPEC, USB_DFU_SUBCLASS, USB_DFU_PROTO_DFUMODE) },
+		USB_CLASS_APP_SPEC, USB_DFU_SUBCLASS, USB_DFU_PROTO_DFUMODE) },
 	{ }
 };
 MODULE_DEVICE_TABLE(usb, dfu_ids);
@@ -109,7 +109,7 @@ static inline int dfu_finish_dnload(const struct dfu_device *dfudev,
 static int dfu_open(struct inode *inode, struct file *filp)
 {
 	struct dfu_device *dfudev;
-	int state, retv;
+	int state, retv, buflen;
 	struct dfu_control *ctrl;
 
 	retv = 0;
@@ -118,16 +118,18 @@ static int dfu_open(struct inode *inode, struct file *filp)
 	if (mutex_lock_interruptible(&dfudev->dfulock))
 		return -EBUSY;
 
-	dfudev->databuf = kmalloc(dfudev->xfersize+2*sizeof(struct dfu_control),
-					GFP_KERNEL);
+	buflen = dfudev->xfersize + 2*sizeof(struct dfu_control) +
+			2*sizeof(struct urb);
+	dfudev->databuf = kmalloc(buflen, GFP_KERNEL);
 	if (!dfudev->databuf) {
 		retv = -ENOMEM;
 		goto err_10;
 	}
 	dfudev->opctrl = dfudev->databuf + dfudev->xfersize;
 	dfudev->stctrl = dfudev->opctrl + 1;
+	dfudev->opctrl->urb = (void *)(dfudev->stctrl + 1);
+	dfudev->stctrl->urb = dfudev->opctrl->urb + 1;
 	ctrl = dfudev->stctrl;
-	ctrl->urb = NULL;
 	state = dfu_get_state(dfudev, ctrl);
 	if (state != dfuIDLE) {
 		dev_err(&dfudev->intf->dev, "Bad Initial State: %d\n", state);
@@ -180,34 +182,23 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	dma_addr_t dmabuf;
 	struct device *ctrler;
 
-	if (count <= 0)
+	if (count == 0)
 		return 0;
 
 	dfudev = filp->private_data;
 	opctrl = dfudev->opctrl;
 	stctrl = dfudev->stctrl;
-	stctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!stctrl->urb)
-		return -ENOMEM;
 	numb = 0;
 	dfust = dfu_get_state(dfudev, stctrl);
 	if (dfust != dfuIDLE && dfust != dfuUPLOAD_IDLE) {
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
-		numb = -EINVAL;
-		goto exit_10;
+		return -EINVAL;
 	}
 	if (*f_pos != 0 && dfust == dfuIDLE)
 		return 0;
 
-	if (!access_ok(VERIFY_WRITE, buff, count)) {
-		numb = -EFAULT;
-		goto exit_10;
-	}
-	opctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dfudev->opctrl->urb) {
-		numb = -ENOMEM;
-		goto exit_10;
-	}
+	if (!access_ok(VERIFY_WRITE, buff, count))
+		return -EFAULT;
 
 	ctrler = dfudev->usbdev->bus->controller;
 	dmabuf = ~0;
@@ -243,7 +234,7 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 				"Uploading failed. DFU State: %d\n", dfust);
 			break;
 		}
-		len = ACCESS_ONCE(opctrl->nxfer);
+		len = READ_ONCE(opctrl->nxfer);
 		dma_sync_single_for_cpu(ctrler, dmabuf, len, DMA_FROM_DEVICE);
 		if (copy_to_user(buff+numb, dfudev->databuf, len))
 			break;
@@ -256,10 +247,7 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	if (dma)
 		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
 				DMA_FROM_DEVICE);
-	usb_free_urb(opctrl->urb);
 
-exit_10:
-	usb_free_urb(stctrl->urb);
 	return numb;
 }
 
@@ -273,32 +261,24 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 	dma_addr_t dmabuf;
 	struct device *ctrler;
 
-	if (count <= 0)
+	if (count == 0)
 		return 0;
 
 	dfudev = filp->private_data;
 	opctrl = dfudev->opctrl;
 	stctrl = dfudev->stctrl;
-	stctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!stctrl->urb)
-		return -ENOMEM;
 	numb = 0;
 	dfust = dfu_get_state(dfudev, stctrl);
 	if (dfust != dfuIDLE && dfust != dfuDNLOAD_IDLE) {
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
-		numb = -EINVAL;
-		goto exit_10;
+		return -EINVAL;
 	}
-	if (!access_ok(VERIFY_READ, buff, count)) {
-		numb = -EFAULT;
-		goto exit_10;
-	}
+	if (!access_ok(VERIFY_READ, buff, count))
+		return -EFAULT;
 
 	opctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dfudev->opctrl->urb) {
-		numb = -ENOMEM;
-		goto exit_10;
-	}
+	if (!dfudev->opctrl->urb)
+		return -ENOMEM;
 
 	ctrler = dfudev->usbdev->bus->controller;
 	dmabuf = ~0;
@@ -334,7 +314,7 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 		if (dfu_submit_urb(dfudev, opctrl) ||
 				dfu_get_status(dfudev, stctrl))
 			break;
-		len = ACCESS_ONCE(opctrl->nxfer);
+		len = READ_ONCE(opctrl->nxfer);
 		numb += len;
 		lenrem -= len;
 		blknum++;
@@ -354,15 +334,12 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 		}
 	} while (len == opctrl->len && lenrem > 0);
 	if (*f_pos != 0 || numb > 32)
- 		*f_pos += numb;
+		*f_pos += numb;
 
 	if (dma)
 		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
 				DMA_FROM_DEVICE);
-	usb_free_urb(opctrl->urb);
 
-exit_10:
-	usb_free_urb(stctrl->urb);
 	return numb;
 }
 
@@ -396,7 +373,7 @@ static ssize_t dfu_sndcmd(struct device *dev, struct device_attribute *attr,
 	if (!bounce)
 		return -ENOMEM;
 	memcpy(bounce, buf, count);
-	
+
 	ctrl = bounce + align16;
 	ctrl->req.bRequestType = 0x21;
 	ctrl->req.bRequest = USB_DFU_DNLOAD;
@@ -433,8 +410,8 @@ static ssize_t dfu_attr_show(struct device *dev, struct device_attribute *attr,
 		dfudev->detach);
 }
 
-static ssize_t dfu_timeout_show(struct device *dev, struct device_attribute *attr,
-			char *buf)
+static ssize_t dfu_timeout_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	struct dfu_device *dfudev;
 
@@ -442,8 +419,8 @@ static ssize_t dfu_timeout_show(struct device *dev, struct device_attribute *att
 	return sprintf(buf, "%d\n", dfudev->dettmout);
 }
 
-static ssize_t dfu_xfersize_show(struct device *dev, struct device_attribute *attr,
-			char *buf)
+static ssize_t dfu_xfersize_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	struct dfu_device *dfudev;
 
@@ -555,66 +532,73 @@ static int dfu_create_attrs(struct dfu_device *dfudev)
 	int retv = 0;
 
 	dfudev->tachattr.attr.name = "dfucmd";
-	dfudev->tachattr.attr.mode = S_IWUSR;
+	dfudev->tachattr.attr.mode = 0200;
 	dfudev->tachattr.show = NULL;
 	dfudev->tachattr.store = dfu_sndcmd;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->tachattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		return retv;
 	}
 	dfudev->attrattr.attr.name = "attr";
-	dfudev->attrattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->attrattr.attr.mode = 0444;
 	dfudev->attrattr.show = dfu_attr_show;
 	dfudev->attrattr.store = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->attrattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_10;
 	}
 	dfudev->tmoutattr.attr.name = "timeout";
-	dfudev->tmoutattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->tmoutattr.attr.mode = 0444;
 	dfudev->tmoutattr.show = dfu_timeout_show;
 	dfudev->tmoutattr.store = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->tmoutattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_20;
 	}
 	dfudev->xsizeattr.attr.name = "xfersize";
-	dfudev->xsizeattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->xsizeattr.attr.mode = 0444;
 	dfudev->xsizeattr.show = dfu_xfersize_show;
 	dfudev->xsizeattr.store = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->xsizeattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_30;
 	}
 	dfudev->statattr.attr.name = "state";
-	dfudev->statattr.attr.mode = S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->statattr.attr.mode = 0444;
 	dfudev->statattr.show = dfu_state_show;
 	dfudev->statattr.store = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->statattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_40;
 	}
 	dfudev->abortattr.attr.name = "clear";
-	dfudev->abortattr.attr.mode = S_IWUSR;
+	dfudev->abortattr.attr.mode = 0200;
 	dfudev->abortattr.store = dfu_clear_cmd;
 	dfudev->abortattr.show = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->abortattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_50;
 	}
 	dfudev->queryattr.attr.name = "query";
-	dfudev->queryattr.attr.mode =  S_IRUSR|S_IRGRP|S_IROTH;
+	dfudev->queryattr.attr.mode =  0444;
 	dfudev->queryattr.show = dfu_query_show;
 	dfudev->queryattr.store = NULL;
 	retv = device_create_file(&dfudev->intf->dev, &dfudev->queryattr);
 	if (retv != 0) {
-		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n", retv);
+		dev_err(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
+				retv);
 		goto err_60;
 	}
 
@@ -651,7 +635,7 @@ static int dfu_probe(struct usb_interface *intf,
 {
 	int retv;
 	struct dfu_device *dfudev;
-	
+
 	retv = dfu_prepare(&dfudev, intf, id);
 	if (retv)
 		return retv;
