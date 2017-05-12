@@ -1,5 +1,5 @@
 /*
- * usbtiva.c
+ * usbdfu1.c
  *
  * Copyright (c) 2017 Dashi Cao        <dscao999@hotmail.com, caods1@lenovo.com>
  *
@@ -13,10 +13,12 @@
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/fs.h>
-#include <linux/cdev.h>
 #include <linux/dma-mapping.h>
 #include <linux/uaccess.h>
-#include "usbdfu.h"
+#include "usbdfu1.h"
+
+#define BLKSIZE	1024
+#define DFUDEV_NAME "dfu"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Dashi Cao");
@@ -25,6 +27,16 @@ MODULE_DESCRIPTION("Tiva C USB DFU Driver");
 #define USB_VENDOR_LUMINARY 0x1cbe
 #define USB_PRODUCT_STELLARIS_DFU 0x0ff
 
+static int max_dfus = 8;
+module_param(max_dfus, int, 0644);
+MODULE_PARM_DESC(max_dfus, "Maximum number of USB DFU devices. "
+	"Default: 8");
+
+int urb_timeout = 200; /* milliseconds */
+module_param(urb_timeout, int, 0644);
+MODULE_PARM_DESC(urb_timeout, "USB urb completion timeout. "
+	"Default: 200 milliseconds.");
+
 static const struct usb_device_id dfu_ids[] = {
 	{ USB_DFU_INTERFACE_INFO(USB_VENDOR_LUMINARY,
 		USB_CLASS_APP_SPEC, USB_DFU_SUBCLASS, USB_DFU_PROTO_DFUMODE) },
@@ -32,78 +44,82 @@ static const struct usb_device_id dfu_ids[] = {
 };
 MODULE_DEVICE_TABLE(usb, dfu_ids);
 
-static inline int dfu_abort(struct dfu_device *dfudev, struct dfu_control *ctrl)
+static dev_t dfu_devno;
+static struct class *dfu_class;
+
+static inline int dfu_abort(struct dfu_control *ctrl)
 {
 	ctrl->req.bRequestType = 0x21;
 	ctrl->req.bRequest = USB_DFU_ABORT;
-	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wIndex = cpu_to_le16(ctrl->intfnum);
 	ctrl->req.wValue = 0;
 	ctrl->req.wLength = 0;
-	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = NULL;
+	ctrl->pipe = usb_sndctrlpipe(ctrl->usbdev, 0);
+	ctrl->datbuf = NULL;
 	ctrl->len = 0;
-	return dfu_submit_urb(dfudev, ctrl);
+	return dfu_submit_urb(ctrl);
 }
 
-static inline int dfu_get_status(const struct dfu_device *dfudev,
-					struct dfu_control *ctrl)
+static inline int dfu_get_status(struct dfu_control *ctrl)
 {
 	ctrl->req.bRequestType = 0xa1;
 	ctrl->req.bRequest = USB_DFU_GETSTATUS;
-	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wIndex = cpu_to_le16(ctrl->intfnum);
 	ctrl->req.wValue = 0;
 	ctrl->req.wLength = cpu_to_le16(6);
-	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = &ctrl->dfuStatus;
+	ctrl->pipe = usb_rcvctrlpipe(ctrl->usbdev, 0);
+	ctrl->datbuf = &ctrl->dfuStatus;
 	ctrl->len = 6;
-	return dfu_submit_urb(dfudev, ctrl);
+	return dfu_submit_urb(ctrl);
 }
 
-static inline int dfu_get_state(const struct dfu_device *dfudev,
-					struct dfu_control *ctrl)
+static inline int dfu_get_state(struct dfu_control *ctrl)
 {
 	int retv;
 
 	ctrl->req.bRequestType = 0xa1;
 	ctrl->req.bRequest = USB_DFU_GETSTATE;
-	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wIndex = cpu_to_le16(ctrl->intfnum);
 	ctrl->req.wValue = 0;
 	ctrl->req.wLength = cpu_to_le16(1);
-	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = &ctrl->dfuState;
+	ctrl->pipe = usb_rcvctrlpipe(ctrl->usbdev, 0);
+	ctrl->datbuf = &ctrl->dfuState;
 	ctrl->len = 1;
-	retv = dfu_submit_urb(dfudev, ctrl);
+	retv = dfu_submit_urb(ctrl);
 	if (retv == 0)
 		retv = ctrl->dfuState;
 	return retv;
 }
 
-static inline int dfu_clr_status(const struct dfu_device *dfudev,
-					struct dfu_control *ctrl)
+static inline int dfu_clr_status(struct dfu_control *ctrl)
 {
 	ctrl->req.bRequestType = 0x21;
 	ctrl->req.bRequest = USB_DFU_CLRSTATUS;
-	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wIndex = cpu_to_le16(ctrl->intfnum);
 	ctrl->req.wValue = 0;
 	ctrl->req.wLength = 0;
-	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = NULL;
+	ctrl->pipe = usb_sndctrlpipe(ctrl->usbdev, 0);
+	ctrl->datbuf = NULL;
 	ctrl->len = 0;
-	return dfu_submit_urb(dfudev, ctrl);
+	return dfu_submit_urb(ctrl);
 }
 
-static inline int dfu_finish_dnload(const struct dfu_device *dfudev,
-					struct dfu_control *ctrl)
+static inline int dfu_finish_dnload(struct dfu_control *ctrl)
 {
 	ctrl->req.bRequestType = 0x21;
 	ctrl->req.bRequest = USB_DFU_DNLOAD;
-	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
+	ctrl->req.wIndex = cpu_to_le16(ctrl->intfnum);
 	ctrl->req.wValue = 0;
 	ctrl->req.wLength = 0;
-	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = NULL;
+	ctrl->pipe = usb_sndctrlpipe(ctrl->usbdev, 0);
+	ctrl->datbuf = NULL;
 	ctrl->len = 0;
-	return dfu_submit_urb(dfudev, ctrl);
+	return dfu_submit_urb(ctrl);
+}
+
+static inline unsigned int altrim(unsigned int v, int sf)
+{
+	return (((v -1) >> sf) + 1) << sf;
 }
 
 static int dfu_open(struct inode *inode, struct file *filp)
@@ -111,38 +127,55 @@ static int dfu_open(struct inode *inode, struct file *filp)
 	struct dfu_device *dfudev;
 	int state, retv, buflen;
 	struct dfu_control *ctrl;
+	void *datbuf;
 
 	retv = 0;
-	dfudev = container_of(inode->i_cdev, struct dfu_device, dfu_cdev);
+	dfudev = container_of(inode->i_cdev, struct dfu_device, cdev);
 	filp->private_data = dfudev;
-	if (mutex_lock_interruptible(&dfudev->dfulock))
+	if (mutex_lock_interruptible(&dfudev->lock))
 		return -EBUSY;
 
-	buflen = dfudev->xfersize + 2*sizeof(struct dfu_control) +
-			2*sizeof(struct urb);
-	dfudev->databuf = kmalloc(buflen, GFP_KERNEL);
-	if (!dfudev->databuf) {
+	buflen = altrim(dfudev->xfersize, 4) + 2*sizeof(struct dfu_control);
+	datbuf = kmalloc(buflen, GFP_KERNEL);
+	if (!datbuf) {
 		retv = -ENOMEM;
 		goto err_10;
 	}
-	dfudev->opctrl = dfudev->databuf + dfudev->xfersize;
+	dfudev->datbuf = datbuf;
+	dfudev->opctrl = datbuf + altrim(dfudev->xfersize, 4);
+	dfudev->opctrl->datbuf = datbuf;
+	dfudev->opctrl->dfurb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!dfudev->opctrl->dfurb) {
+		retv = -ENOMEM;
+		goto err_20;
+	}
+	dfudev->opctrl->usbdev = dfudev->usbdev;
+	dfudev->opctrl->intf = dfudev->intf;
+	dfudev->opctrl->intfnum = dfudev->intfnum;
+	
 	dfudev->stctrl = dfudev->opctrl + 1;
-	dfudev->opctrl->urb = (void *)(dfudev->stctrl + 1);
-	dfudev->stctrl->urb = dfudev->opctrl->urb + 1;
+	dfudev->stctrl->datbuf = NULL;
+	dfudev->stctrl->dfurb = dfudev->opctrl->dfurb;
+	dfudev->stctrl->usbdev = dfudev->usbdev;
+	dfudev->stctrl->intf = dfudev->intf;
+	dfudev->stctrl->intfnum = dfudev->intfnum;
+
 	ctrl = dfudev->stctrl;
-	state = dfu_get_state(dfudev, ctrl);
+	state = dfu_get_state(ctrl);
 	if (state != dfuIDLE) {
 		dev_err(&dfudev->intf->dev, "Bad Initial State: %d\n", state);
 		retv =  -EBUSY;
-		goto err_20;
+		goto err_30;
 	}
 
 	return retv;
 
+err_30:
+	usb_free_urb(dfudev->stctrl->dfurb);
 err_20:
-	kfree(dfudev->databuf);
+	kfree(datbuf);
 err_10:
-	mutex_unlock(&dfudev->dfulock);
+	mutex_unlock(&dfudev->lock);
 	return retv;
 }
 
@@ -154,21 +187,22 @@ static int dfu_release(struct inode *inode, struct file *filp)
 
 	dfudev = filp->private_data;
 	stctrl = dfudev->stctrl;
-	stctrl->urb = NULL;
-	retv = dfu_get_state(dfudev, stctrl);
+	retv = dfu_get_state(stctrl);
 	if (retv == dfuDNLOAD_IDLE)
-		dfu_finish_dnload(dfudev, stctrl);
+		dfu_finish_dnload(stctrl);
 	else if (retv == dfuERROR)
-		dfu_clr_status(dfudev, stctrl);
+		dfu_clr_status(stctrl);
 	else if (retv != dfuIDLE)
-		dfu_abort(dfudev, stctrl);
+		dfu_abort(stctrl);
 	msleep(100);
-	retv = dfu_get_state(dfudev, stctrl);
+	retv = dfu_get_state(stctrl);
 	if (retv != dfuIDLE)
 		dev_err(&dfudev->intf->dev, "Need Reset! Stuck in State: %d\n",
 				retv);
-	kfree(dfudev->databuf);
-	mutex_unlock(&dfudev->dfulock);
+	usb_free_urb(stctrl->dfurb);
+	kfree(dfudev->datbuf);
+	mutex_unlock(&dfudev->lock);
+	filp->private_data = NULL;
 	return 0;
 }
 
@@ -184,12 +218,13 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 
 	if (count == 0)
 		return 0;
-
 	dfudev = filp->private_data;
+	if (count % dfudev->xfersize != 0)
+		return -EINVAL;
+		
 	opctrl = dfudev->opctrl;
 	stctrl = dfudev->stctrl;
-	numb = 0;
-	dfust = dfu_get_state(dfudev, stctrl);
+	dfust = dfu_get_state(stctrl);
 	if (dfust != dfuIDLE && dfust != dfuUPLOAD_IDLE) {
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
 		return -EINVAL;
@@ -208,25 +243,24 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	opctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 	opctrl->req.wLength = cpu_to_le16(dfudev->xfersize);
 	opctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
-	opctrl->buff = dfudev->databuf;
 	opctrl->len = dfudev->xfersize;
 	if (dfudev->dma) {
-		dmabuf = dma_map_single(ctrler, opctrl->buff, dfudev->xfersize,
+		dmabuf = dma_map_single(ctrler, opctrl->datbuf, dfudev->xfersize,
 					DMA_FROM_DEVICE);
 		if (!dma_mapping_error(ctrler, dmabuf)) {
 			dma = 1;
-			opctrl->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-			opctrl->urb->transfer_dma = dmabuf;
+			opctrl->dfurb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+			opctrl->dfurb->transfer_dma = dmabuf;
 		} else
 			dev_warn(&dfudev->intf->dev,
 					"Cannot map DMA address\n");
 	}
 
-	blknum = *f_pos / dfudev->xfersize;
+	blknum = *f_pos / BLKSIZE;
+	numb = 0;
 	do {
 		opctrl->req.wValue = cpu_to_le16(blknum);
-		if (dfu_submit_urb(dfudev, opctrl) ||
-				dfu_get_status(dfudev, stctrl))
+		if (dfu_submit_urb(opctrl) || dfu_get_status(stctrl))
 			break;
 		dfust = stctrl->dfuStatus.bState;
 		if (dfust != dfuUPLOAD_IDLE && dfust != dfuIDLE) {
@@ -235,14 +269,18 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 			break;
 		}
 		len = READ_ONCE(opctrl->nxfer);
-		dma_sync_single_for_cpu(ctrler, dmabuf, len, DMA_FROM_DEVICE);
-		if (copy_to_user(buff+numb, dfudev->databuf, len))
+		if (len == 0)
 			break;
+		dma_sync_single_for_cpu(ctrler, dmabuf, len, DMA_FROM_DEVICE);
+		if (copy_to_user(buff+numb, opctrl->datbuf, len)) {
+			dev_err(&dfudev->intf->dev,
+				"Failed to copy into user space!\n");
+			break;
+		}
 		numb += len;
-		blknum++;
+		blknum += len / BLKSIZE;
 	} while (len == opctrl->len && numb < count);
-	if (*f_pos != 0 || numb > 32)
-		*f_pos += numb;
+	*f_pos += numb;
 
 	if (dma)
 		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
@@ -263,22 +301,19 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 
 	if (count == 0)
 		return 0;
-
 	dfudev = filp->private_data;
+	if (count % dfudev->xfersize != 0)
+		return -EINVAL;
+
 	opctrl = dfudev->opctrl;
 	stctrl = dfudev->stctrl;
-	numb = 0;
-	dfust = dfu_get_state(dfudev, stctrl);
+	dfust = dfu_get_state(stctrl);
 	if (dfust != dfuIDLE && dfust != dfuDNLOAD_IDLE) {
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
 		return -EINVAL;
 	}
 	if (!access_ok(VERIFY_READ, buff, count))
 		return -EFAULT;
-
-	opctrl->urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dfudev->opctrl->urb)
-		return -ENOMEM;
 
 	ctrler = dfudev->usbdev->bus->controller;
 	dmabuf = ~0;
@@ -287,43 +322,42 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 	opctrl->req.bRequest = USB_DFU_DNLOAD;
 	opctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 	opctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
-	opctrl->buff = dfudev->databuf;
 	if (dfudev->dma) {
-		dmabuf = dma_map_single(ctrler, opctrl->buff, dfudev->xfersize,
+		dmabuf = dma_map_single(ctrler, opctrl->datbuf, dfudev->xfersize,
 					DMA_TO_DEVICE);
 		if (!dma_mapping_error(ctrler, dmabuf)) {
 			dma = 1;
-			opctrl->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-			opctrl->urb->transfer_dma = dmabuf;
+			opctrl->dfurb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+			opctrl->dfurb->transfer_dma = dmabuf;
 		} else
 			dev_warn(&dfudev->intf->dev,
 					"Cannot map DMA address\n");
 	}
 
-	blknum = *f_pos / dfudev->xfersize;
+	blknum = *f_pos / BLKSIZE;
 	lenrem = count;
+	numb = 0;
 	do {
 		opctrl->len = dfudev->xfersize > lenrem ? lenrem :
 							dfudev->xfersize;
-		if (copy_from_user(dfudev->databuf, buff+numb, opctrl->len))
+		if (copy_from_user(dfudev->datbuf, buff+numb, opctrl->len))
 			break;
 		opctrl->req.wValue = cpu_to_le16(blknum);
 		opctrl->req.wLength = cpu_to_le16(opctrl->len);
 		dma_sync_single_for_device(ctrler, dmabuf, opctrl->len,
 						DMA_TO_DEVICE);
-		if (dfu_submit_urb(dfudev, opctrl) ||
-				dfu_get_status(dfudev, stctrl))
+		if (dfu_submit_urb(opctrl) || dfu_get_status(stctrl))
 			break;
 		len = READ_ONCE(opctrl->nxfer);
 		numb += len;
 		lenrem -= len;
-		blknum++;
+		blknum += len / BLKSIZE;
 		while (stctrl->dfuStatus.bState == dfuDNLOAD_BUSY) {
 			tmout = stctrl->dfuStatus.wmsec[0] |
 					(stctrl->dfuStatus.wmsec[1] << 8) |
 					(stctrl->dfuStatus.wmsec[2] << 16);
 			msleep(tmout);
-			if (dfu_get_status(dfudev, stctrl))
+			if (dfu_get_status(stctrl))
 				break;
 		}
 		if (stctrl->dfuStatus.bState != dfuDNLOAD_IDLE &&
@@ -333,8 +367,7 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 			break;
 		}
 	} while (len == opctrl->len && lenrem > 0);
-	if (*f_pos != 0 || numb > 32)
-		*f_pos += numb;
+	*f_pos += numb;
 
 	if (dma)
 		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
@@ -356,35 +389,38 @@ static ssize_t dfu_sndcmd(struct device *dev, struct device_attribute *attr,
 {
 	struct dfu_device *dfudev;
 	struct dfu_control *ctrl;
-	void *bounce;
-	int align16;
 
 	if (count < 4 || count > 32)
 		return count;
 
 	dfudev = container_of(attr, struct dfu_device, tachattr);
-	if (!mutex_trylock(&dfudev->dfulock)) {
+	if (!mutex_trylock(&dfudev->lock)) {
 		dev_err(&dfudev->intf->dev,
 				"Cannot send command, device busy\n");
 		return count;
 	}
-	align16 = (((count-1) >> 4) + 1) << 4;
-	bounce = kmalloc(sizeof(struct dfu_control)+align16, GFP_KERNEL);
-	if (!bounce)
+	ctrl = kmalloc(sizeof(struct dfu_control) + count, GFP_KERNEL);
+	if (!ctrl)
 		return -ENOMEM;
-	memcpy(bounce, buf, count);
+	ctrl->dfurb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!ctrl->dfurb) {
+		kfree(ctrl);
+		return -ENOMEM;
+	}
 
-	ctrl = bounce + align16;
+	ctrl->usbdev = dfudev->usbdev;
+	ctrl->intf = dfudev->intf;
+	ctrl->intfnum = dfudev->intfnum;
 	ctrl->req.bRequestType = 0x21;
 	ctrl->req.bRequest = USB_DFU_DNLOAD;
 	ctrl->req.wValue = 0;
 	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 	ctrl->req.wLength = cpu_to_le16(count);
 	ctrl->pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = bounce;
+	ctrl->datbuf = ctrl + 1;
+	memcpy(ctrl->datbuf, buf, count);
 	ctrl->len = count;
-	ctrl->urb = NULL;
-	if (dfu_submit_urb(dfudev, ctrl) || dfu_get_status(dfudev, ctrl))
+	if (dfu_submit_urb(ctrl) || dfu_get_status(ctrl))
 		dev_err(&dfudev->intf->dev,
 				"DFU command failed: %d, State: %d\n",
 				(int)ctrl->dfuStatus.bStatus,
@@ -394,8 +430,9 @@ static ssize_t dfu_sndcmd(struct device *dev, struct device_attribute *attr,
 				"DFU commmand status: %d, State: %d\n",
 				(int)ctrl->dfuStatus.bStatus,
 				(int)ctrl->dfuStatus.bState);
-	kfree(bounce);
-	mutex_unlock(&dfudev->dfulock);
+	usb_free_urb(ctrl->dfurb);
+	kfree(ctrl);
+	mutex_unlock(&dfudev->lock);
 	return count;
 }
 
@@ -437,10 +474,18 @@ static ssize_t dfu_state_show(struct device *dev, struct device_attribute *attr,
 
 	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
 	if (!ctrl)
-		return 0;
+		return -ENOMEM;
 	dfudev = container_of(attr, struct dfu_device, statattr);
-	ctrl->urb = NULL;
-	dfstat = dfu_get_state(dfudev, ctrl);
+	ctrl->dfurb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!ctrl->dfurb) {
+		kfree(ctrl);
+		return -ENOMEM;
+	}
+	ctrl->usbdev = dfudev->usbdev;
+	ctrl->intf = dfudev->intf;
+	ctrl->intfnum = dfudev->intfnum;
+	dfstat = dfu_get_state(ctrl);
+	usb_free_urb(ctrl->dfurb);
 	kfree(ctrl);
 	return sprintf(buf, "%d\n", dfstat);
 }
@@ -461,10 +506,10 @@ static ssize_t stellaris_show(struct dfu_device *dfudev,
 	ctrl->req.wIndex = cpu_to_le16(dfudev->intfnum);
 	ctrl->req.wLength = 4;
 	ctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
-	ctrl->buff = ctrl->ocupy;
+	ctrl->datbuf = ctrl->ocupy;
 	ctrl->len = sizeof(struct tidfu);
-	stellaris = ctrl->buff;
-	if (dfu_submit_urb(dfudev, ctrl) == 0) {
+	stellaris = ctrl->datbuf;
+	if (dfu_submit_urb(ctrl) == 0) {
 		usMarker = le16_to_cpu(stellaris->usMarker);
 		usVersion = le16_to_cpu(stellaris->usVersion);
 		num = sprintf(buf, "Stellaris Marker: %4.4X, Version: %4.4X\n",
@@ -486,13 +531,21 @@ static ssize_t dfu_query_show(struct device *dev, struct device_attribute *attr,
 	idProduct = le16_to_cpu(dfudev->usbdev->descriptor.idProduct);
 	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
 	if (!ctrl)
-		return 0;
-	ctrl->urb = NULL;
+		return -ENOMEM;
+	ctrl->dfurb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!ctrl->dfurb) {
+		kfree(ctrl);
+		return -ENOMEM;
+	}
+	ctrl->usbdev = dfudev->usbdev;
+	ctrl->intf = dfudev->intf;
+	ctrl->intfnum = dfudev->intfnum;
 	numbytes = 0;
 	if (idVendor == USB_VENDOR_LUMINARY &&
 	    idProduct == USB_PRODUCT_STELLARIS_DFU)
 		numbytes = stellaris_show(dfudev, ctrl, buf);
 
+	usb_free_urb(ctrl->dfurb);
 	kfree(ctrl);
 	return numbytes;
 }
@@ -504,25 +557,39 @@ static ssize_t dfu_clear_cmd(struct device *dev, struct device_attribute *attr,
 	struct dfu_control *ctrl;
 	int dfust;
 
+	dfudev = container_of(attr, struct dfu_device, abortattr);
+	if (*buf != '1') {
+		dev_warn(&dfudev->intf->dev, "Invalid command: %c\n", *buf);
+		return count;
+	}
+
 	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
 	if (!ctrl)
-		return 0;
-	dfudev = container_of(attr, struct dfu_device, abortattr);
-	ctrl->urb = NULL;
-	dfust = dfu_get_state(dfudev, ctrl);
+		return -ENOMEM;
+	ctrl->dfurb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!ctrl->dfurb) {
+		kfree(ctrl);
+		return -ENOMEM;
+	}
+
+	ctrl->usbdev = dfudev->usbdev;
+	ctrl->intf = dfudev->intf;
+	ctrl->intfnum = dfudev->intfnum;
+	dfust = dfu_get_state(ctrl);
 	switch (dfust) {
 	case dfuDNLOAD_IDLE:
 	case dfuUPLOAD_IDLE:
-		dfu_abort(dfudev, ctrl);
+		dfu_abort(ctrl);
 		break;
 	case dfuERROR:
-		dfu_clr_status(dfudev, ctrl);
+		dfu_clr_status(ctrl);
 		break;
 	default:
 		dev_warn(&dfudev->intf->dev, "Cannot clear, in state: %d\n",
 				dfust);
 		break;
 	}
+	usb_free_urb(ctrl->dfurb);
 	kfree(ctrl);
 	return count;
 }
@@ -630,30 +697,71 @@ static void dfu_remove_attrs(struct dfu_device *dfudev)
 	device_remove_file(&dfudev->intf->dev, &dfudev->tachattr);
 }
 
+static atomic_t dfu_index = ATOMIC_INIT(-1);
+static atomic_t *dev_minors;
+
 static int dfu_probe(struct usb_interface *intf,
 			const struct usb_device_id *id)
 {
-	int retv;
+	int retv, dfufdsc_len, index;
 	struct dfu_device *dfudev;
+	struct dfufdsc *dfufdsc;
 
-	retv = dfu_prepare(&dfudev, intf, id);
-	if (retv)
-		return retv;
-
+	retv = 0;
+	dfufdsc = (struct dfufdsc *)intf->cur_altsetting->extra;
+	dfufdsc_len = intf->cur_altsetting->extralen;
+	if (!dfufdsc || dfufdsc_len != USB_DFU_FUNC_DSCLEN ||
+			dfufdsc->dsctyp != USB_DFU_FUNC_DSCTYP) {
+		dev_err(&intf->dev, "Invalid DFU functional descriptor\n");
+		return -ENODEV;
+	}
+	index = atomic_inc_return(&dfu_index);
+	if (!(index < max_dfus)) {
+		dev_err(&intf->dev, "Maximum supported USB DFU reached: %d\n",
+				max_dfus);
+		retv = -ENODEV;
+		goto err_05;
+	}
+	dfudev = kmalloc(sizeof(struct dfu_device), GFP_KERNEL);
+	if (!dfudev) {
+		retv = -ENOMEM;
+		goto err_05;
+	}
+	dfudev->download = (dfufdsc->attr & 0x01) ? 1 : 0;
+	dfudev->upload = (dfufdsc->attr & 0x02) ? 1 : 0;
+	dfudev->manifest = (dfufdsc->attr & 0x04) ? 1 : 0;
+	dfudev->detach = (dfufdsc->attr & 0x08) ? 1 : 0;
+	dfudev->dettmout = le16_to_cpu(dfufdsc->tmout);
+	dfudev->xfersize = le16_to_cpu(dfufdsc->xfersize);
+	dfudev->intf = intf;
+	dfudev->usbdev = interface_to_usbdev(intf);
+	dfudev->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
 	dfudev->proto = 2;
+	if (dfudev->usbdev->bus->controller->dma_mask)
+		dfudev->dma = 1;
+	else
+		dfudev->dma = 0;
+	mutex_init(&dfudev->lock);
+
 	retv = dfu_create_attrs(dfudev);
 	if (retv)
 		goto err_10;
 
-	cdev_init(&dfudev->dfu_cdev, &dfu_fops);
-	dfudev->dfu_cdev.owner = THIS_MODULE;
-	retv = cdev_add(&dfudev->dfu_cdev, dfudev->devnum, 1);
+	int i;
+        for (i = 0; i < max_dfus; i++)
+                if (!atomic_xchg(dev_minors+i, 1))
+                        break;
+        dfudev->devno = MKDEV(MAJOR(dfu_devno), i);
+
+	cdev_init(&dfudev->cdev, &dfu_fops);
+	dfudev->cdev.owner = THIS_MODULE;
+	retv = cdev_add(&dfudev->cdev, dfudev->devno, 1);
 	if (retv) {
 		dev_err(&dfudev->intf->dev, "Cannot add device: %d\n", retv);
 		goto err_20;
 	}
-	dfudev->sysdev = device_create(dfu_class, &intf->dev, dfudev->devnum,
-				dfudev, DFUDEV_NAME"%d", MINOR(dfudev->devnum));
+	dfudev->sysdev = device_create(dfu_class, &intf->dev, dfudev->devno,
+				dfudev, DFUDEV_NAME"%d", MINOR(dfudev->devno));
 	if (IS_ERR(dfudev->sysdev)) {
 		retv = (int)PTR_ERR(dfudev->sysdev);
 		dev_err(&dfudev->intf->dev, "Cannot create device file: %d\n",
@@ -661,14 +769,18 @@ static int dfu_probe(struct usb_interface *intf,
 		goto err_30;
 	}
 
+        usb_set_intfdata(intf, dfudev);
 	return retv;
 
 err_30:
-	cdev_del(&dfudev->dfu_cdev);
+	cdev_del(&dfudev->cdev);
 err_20:
+	atomic_set(dev_minors+MINOR(dfudev->devno), 0);
 	dfu_remove_attrs(dfudev);
 err_10:
-	dfu_cleanup(dfudev);
+	kfree(dfudev);
+err_05:
+	atomic_dec(&dfu_index);
 	return retv;
 }
 
@@ -677,10 +789,13 @@ static void dfu_disconnect(struct usb_interface *intf)
 	struct dfu_device *dfudev;
 
 	dfudev = usb_get_intfdata(intf);
-	device_destroy(dfu_class, dfudev->devnum);
-	cdev_del(&dfudev->dfu_cdev);
+	usb_set_intfdata(intf, NULL);
+	device_destroy(dfu_class, dfudev->devno);
+	cdev_del(&dfudev->cdev);
+	atomic_set(dev_minors+MINOR(dfudev->devno), 0);
 	dfu_remove_attrs(dfudev);
-	dfu_cleanup(dfudev);
+	kfree(dfudev);
+	atomic_dec(&dfu_index);
 }
 
 static struct usb_driver dfu_driver = {
@@ -692,17 +807,50 @@ static struct usb_driver dfu_driver = {
 
 static int __init usbdfu_init(void)
 {
-	int retv;
+	int i, retv;
 
-	retv = usb_register(&dfu_driver);
-	if (retv)
+	retv = alloc_chrdev_region(&dfu_devno, 0, max_dfus, DFUDEV_NAME);
+	if (retv != 0) {
+		pr_err("Cannot allocate a char major number: %d\n", retv);
+		return retv;
+	}
+	dfu_class = class_create(THIS_MODULE, DFUDEV_NAME);
+	if (IS_ERR(dfu_class)) {
+		retv = (int)PTR_ERR(dfu_class);
+		pr_err("Cannot create DFU class, Out of Memory!\n");
+		goto err_10;
+	}
+	dev_minors = kmalloc_array(max_dfus, sizeof(atomic_t), GFP_KERNEL);
+	if (!dev_minors) {
+		retv = -ENOMEM;
+		pr_err("Cannot allocate minor talbe, Out of Memory\n");
+		goto err_20;
+	}
+	for (i = 0; i < max_dfus; i++)
+		atomic_set(dev_minors+i, 0);
+        retv = usb_register(&dfu_driver);
+	if (retv) {
 		pr_err("Cannot register USB DFU driver: %d\n", retv);
+		goto err_30;
+	}
+
+        return 0;
+
+err_30:
+	kfree(dev_minors);
+err_20:
+	class_destroy(dfu_class);
+err_10:
+	unregister_chrdev_region(dfu_devno, max_dfus);
 	return retv;
 }
 
 static void __exit usbdfu_exit(void)
 {
 	usb_deregister(&dfu_driver);
+	kfree(dev_minors);
+	class_destroy(dfu_class);
+	unregister_chrdev_region(dfu_devno, max_dfus);
 }
 
 module_init(usbdfu_init);

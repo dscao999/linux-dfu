@@ -8,7 +8,6 @@
  * USB Abstract Control Model driver for USB Device Firmware Upgrade
  *
 */
-#include <linux/cdev.h>
 #include <linux/usb.h>
 
 #define USB_DFU_DETACH		0
@@ -34,8 +33,6 @@
         .bInterfaceClass = (cl), \
         .bInterfaceSubClass = (sc), \
         .bInterfaceProtocol = (pr)
-
-#define DFUDEV_NAME	"dfu"
 
 struct dfufdsc {
 	__u8 len;
@@ -67,62 +64,26 @@ enum dfu_state {
 	dfuERROR = 10
 };
 
-
 struct dfu_control {
-	struct urb *urb;
-	struct completion urbdone;
-	int status;
-	struct usb_ctrlrequest req;
-	int pipe;
-	void *buff;
-	int len;
-	int nxfer;
-	union {
-		unsigned long ocupy[4];
-		struct dfu_status dfuStatus;
-		__u8 dfuState;
-	};
-};
-
-struct dfu_feature {
-	int reset:1;
-};
-
-struct dfu_device {
-	struct mutex dfulock;
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
-	struct device *sysdev;
-	struct device_attribute tachattr;
-	struct device_attribute attrattr;
-	struct device_attribute tmoutattr;
-	struct device_attribute xsizeattr;
-	struct device_attribute statattr;
-	struct device_attribute abortattr;
-	struct device_attribute queryattr;
-	dev_t devnum;
-	void *databuf;
-	struct dfu_control *opctrl, *stctrl;
-	int dma;
-	int index;
-	struct {
-		unsigned int download:1;
-		unsigned int upload:1;
-		unsigned int manifest:1;
-		unsigned int detach:1;
-	};
-	int dettmout;
-	int xfersize;
-	int proto;
+	struct usb_ctrlrequest req;
+	struct completion urbdone;
 	int intfnum;
-	struct cdev dfu_cdev;
+	int status;
+	int pipe;
+	int len;
+	int nxfer;
+	struct urb *dfurb;
+	void *datbuf;
+	union {
+		unsigned long ocupy[8];
+		struct dfu_status dfuStatus;
+		__u8 dfuState;
+		__u8 cmd[32];
+	};
 };
 
-extern struct class *dfu_class;
-
-int dfu_submit_urb(const struct dfu_device *dfudev, struct dfu_control *ctrl);
-int dfu_prepare(struct dfu_device **dfudevp, struct usb_interface *intf,
-                        const struct usb_device_id *d);
-void dfu_cleanup(struct dfu_device *dfudev);
+int dfu_submit_urb(struct dfu_control *ctrl);
 
 #endif /* LINUX_USB_DFU_DSCAO__ */

@@ -1,8 +1,11 @@
 ifneq ($(KERNELRELEASE),)
-	obj-m := usbdfu.o
-	obj-m += dfutiva.o
+	obj-m := dfusb0.o
+	dfusb0-objs := usbdfu0.o usbdfu.o
+	obj-m += dfusb1.o
+	dfusb1-objs := usbdfu1.o usbdfu.o
 
-dfutiva.o usbdfu.o: usbdfu.h
+usbdfu0.o: usbdfu0.h usbdfu.h
+usbdfu1.o: usbdfu1.h usbdfu.h
 
 else
 	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
