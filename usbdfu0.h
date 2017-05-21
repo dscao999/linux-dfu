@@ -10,7 +10,7 @@
 */
 #include "usbdfu.h"
 
-struct dfu_device {
+struct dfu0_device {
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
 	struct device_attribute tachattr;

@@ -18,7 +18,7 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Dashi Cao");
 MODULE_DESCRIPTION("USB DFU Class Driver for Protocol 0");
 
-int urb_timeout = 200; /* milliseconds */
+static int urb_timeout = 200; /* milliseconds */
 module_param(urb_timeout, int, 0644);
 MODULE_PARM_DESC(urb_timeout, "USB urb completion timeout value. "
 	"Default 200 milliseconds.");
@@ -35,7 +35,7 @@ static const struct usb_device_id dfu_ids[] = {
 };
 MODULE_DEVICE_TABLE(usb, dfu_ids);
 
-static int dfu_do_switch(struct dfu_device *dfudev, struct dfu_control *ctrl)
+static int dfu_do_switch(struct dfu0_device *dfudev, struct dfu_control *ctrl)
 {
 	int tmout, retusb;
 
@@ -49,7 +49,7 @@ static int dfu_do_switch(struct dfu_device *dfudev, struct dfu_control *ctrl)
 	ctrl->pipe = usb_sndctrlpipe(ctrl->usbdev, 0);
 	ctrl->len = 0;
 	ctrl->datbuf = NULL;
-	retusb = dfu_submit_urb(ctrl);
+	retusb = dfu_submit_urb(ctrl, urb_timeout);
 	if (retusb == 0 && dfudev->detach == 0)
 		dev_info(&dfudev->intf->dev, "Need reset to switch to DFU\n");
 	return retusb;
@@ -58,10 +58,10 @@ static int dfu_do_switch(struct dfu_device *dfudev, struct dfu_control *ctrl)
 static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
-	struct dfu_device *dfudev;
+	struct dfu0_device *dfudev;
 	struct dfu_control *ctrl;
 
-	dfudev = container_of(attr, struct dfu_device, tachattr);
+	dfudev = container_of(attr, struct dfu0_device, tachattr);
 	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
 	if (!ctrl)
 		return -ENOMEM;
@@ -87,9 +87,9 @@ static ssize_t dfu_switch(struct device *dev, struct device_attribute *attr,
 static ssize_t dfu_attr_show(struct device *dev, struct device_attribute *attr,
 				char *buf)
 {
-	struct dfu_device *dfudev;
+	struct dfu0_device *dfudev;
 
-	dfudev = container_of(attr, struct dfu_device, attrattr);
+	dfudev = container_of(attr, struct dfu0_device, attrattr);
 	return sprintf(buf, "Download:%d Upload:%d Manifest:%d Detach:%d\n",
 		dfudev->download, dfudev->upload, dfudev->manifest,
 		dfudev->detach);
@@ -98,22 +98,22 @@ static ssize_t dfu_attr_show(struct device *dev, struct device_attribute *attr,
 static ssize_t dfu_timeout_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	struct dfu_device *dfudev;
+	struct dfu0_device *dfudev;
 
-	dfudev = container_of(attr, struct dfu_device, tmoutattr);
+	dfudev = container_of(attr, struct dfu0_device, tmoutattr);
 	return sprintf(buf, "%d\n", dfudev->dettmout);
 }
 
 static ssize_t dfu_xfersize_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	struct dfu_device *dfudev;
+	struct dfu0_device *dfudev;
 
-	dfudev = container_of(attr, struct dfu_device, xsizeattr);
+	dfudev = container_of(attr, struct dfu0_device, xsizeattr);
 	return sprintf(buf, "%d\n", dfudev->xfersize);
 }
 
-static int dfu_create_attrs(struct dfu_device *dfudev)
+static int dfu_create_attrs(struct dfu0_device *dfudev)
 {
 	int retv = 0;
 
@@ -169,7 +169,7 @@ err_10:
 	return retv;
 }
 
-static void dfu_remove_attrs(struct dfu_device *dfudev)
+static void dfu_remove_attrs(struct dfu0_device *dfudev)
 {
 	device_remove_file(&dfudev->intf->dev, &dfudev->xsizeattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->tmoutattr);
@@ -181,7 +181,7 @@ static int dfu_probe(struct usb_interface *intf,
 			const struct usb_device_id *id)
 {
 	int retv;
-	struct dfu_device *dfudev;
+	struct dfu0_device *dfudev;
 	struct dfufdsc *dfufdsc;
 	int dfufdsc_len;
 
@@ -193,7 +193,7 @@ static int dfu_probe(struct usb_interface *intf,
 		return -ENODEV;
 	}
 
-	dfudev = kmalloc(sizeof(struct dfu_device), GFP_KERNEL);
+	dfudev = kmalloc(sizeof(struct dfu0_device), GFP_KERNEL);
 	if (!dfudev)
 		return -ENOMEM;
 	dfudev->download = (dfufdsc->attr & 0x01) ? 1 : 0;
@@ -217,7 +217,7 @@ static int dfu_probe(struct usb_interface *intf,
 
 static void dfu_disconnect(struct usb_interface *intf)
 {
-	struct dfu_device *dfudev;
+	struct dfu0_device *dfudev;
 
 	dfudev = usb_get_intfdata(intf);
 	dfu_remove_attrs(dfudev);
@@ -226,7 +226,7 @@ static void dfu_disconnect(struct usb_interface *intf)
 }
 
 static struct usb_driver dfu_driver = {
-	.name = "dfusb",
+	.name = "dfusb0",
 	.probe = dfu_probe,
 	.disconnect = dfu_disconnect,
 	.id_table = dfu_ids,

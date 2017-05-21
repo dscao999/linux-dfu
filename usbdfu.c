@@ -8,8 +8,6 @@
  */
 #include "usbdfu.h"
 
-extern int urb_timeout; /* milliseconds */
-
 static void dfu_ctrlurb_done(struct urb *urb)
 {
 	struct dfu_control *ctrl;
@@ -31,7 +29,7 @@ static void dfu_urb_timeout(struct dfu_control *ctrl)
 			(int)ctrl->req.bRequest);
 }
 
-int dfu_submit_urb(struct dfu_control *ctrl)
+int dfu_submit_urb(struct dfu_control *ctrl, int tmout)
 {
 	int retusb, retv;
 	unsigned long jiff_wait;
@@ -41,9 +39,10 @@ int dfu_submit_urb(struct dfu_control *ctrl)
 			dfu_ctrlurb_done, ctrl);
 	init_completion(&ctrl->urbdone);
 	ctrl->status = USB_DFU_ERROR_CODE;
+	ctrl->nxfer = 0;
 	retusb = usb_submit_urb(ctrl->dfurb, GFP_KERNEL);
 	if (retusb == 0) {
-		jiff_wait = msecs_to_jiffies(urb_timeout);
+		jiff_wait = msecs_to_jiffies(tmout);
 		if (!wait_for_completion_timeout(&ctrl->urbdone, jiff_wait))
 			dfu_urb_timeout(ctrl);
 	} else
@@ -56,7 +55,7 @@ int dfu_submit_urb(struct dfu_control *ctrl)
 		dev_err(&ctrl->intf->dev,
 			"URB type: %2.2x, req: %2.2x request failed: %d\n",
 			(int)ctrl->req.bRequestType, (int)ctrl->req.bRequest,
-			ctrl->status);
+			retv);
 
-	return ctrl->status;
+	return retv;
 }

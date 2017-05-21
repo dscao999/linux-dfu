@@ -11,7 +11,7 @@
 #include <linux/cdev.h>
 #include "usbdfu.h"
 
-struct dfu_device {
+struct dfu1_device {
 	struct mutex lock;
 	struct usb_device *usbdev;
 	struct usb_interface *intf;

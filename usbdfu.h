@@ -84,6 +84,6 @@ struct dfu_control {
 	};
 };
 
-int dfu_submit_urb(struct dfu_control *ctrl);
+int dfu_submit_urb(struct dfu_control *ctrl, int tmout);
 
 #endif /* LINUX_USB_DFU_DSCAO__ */

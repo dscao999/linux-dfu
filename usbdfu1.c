@@ -32,7 +32,7 @@ module_param(max_dfus, int, 0644);
 MODULE_PARM_DESC(max_dfus, "Maximum number of USB DFU devices. "
 	"Default: 8");
 
-int urb_timeout = 200; /* milliseconds */
+static int urb_timeout = 200; /* milliseconds */
 module_param(urb_timeout, int, 0644);
 MODULE_PARM_DESC(urb_timeout, "USB urb completion timeout. "
 	"Default: 200 milliseconds.");
@@ -57,7 +57,7 @@ static inline int dfu_abort(struct dfu_control *ctrl)
 	ctrl->pipe = usb_sndctrlpipe(ctrl->usbdev, 0);
 	ctrl->datbuf = NULL;
 	ctrl->len = 0;
-	return dfu_submit_urb(ctrl);
+	return dfu_submit_urb(ctrl, urb_timeout);
 }
 
 static inline int dfu_get_status(struct dfu_control *ctrl)
@@ -70,7 +70,7 @@ static inline int dfu_get_status(struct dfu_control *ctrl)
 	ctrl->pipe = usb_rcvctrlpipe(ctrl->usbdev, 0);
 	ctrl->datbuf = &ctrl->dfuStatus;
 	ctrl->len = 6;
-	return dfu_submit_urb(ctrl);
+	return dfu_submit_urb(ctrl, urb_timeout);
 }
 
 static inline int dfu_get_state(struct dfu_control *ctrl)
@@ -85,7 +85,7 @@ static inline int dfu_get_state(struct dfu_control *ctrl)
 	ctrl->pipe = usb_rcvctrlpipe(ctrl->usbdev, 0);
 	ctrl->datbuf = &ctrl->dfuState;
 	ctrl->len = 1;
-	retv = dfu_submit_urb(ctrl);
+	retv = dfu_submit_urb(ctrl, urb_timeout);
 	if (retv == 0)
 		retv = ctrl->dfuState;
 	return retv;
@@ -101,7 +101,7 @@ static inline int dfu_clr_status(struct dfu_control *ctrl)
 	ctrl->pipe = usb_sndctrlpipe(ctrl->usbdev, 0);
 	ctrl->datbuf = NULL;
 	ctrl->len = 0;
-	return dfu_submit_urb(ctrl);
+	return dfu_submit_urb(ctrl, urb_timeout);
 }
 
 static inline int dfu_finish_dnload(struct dfu_control *ctrl)
@@ -114,7 +114,7 @@ static inline int dfu_finish_dnload(struct dfu_control *ctrl)
 	ctrl->pipe = usb_sndctrlpipe(ctrl->usbdev, 0);
 	ctrl->datbuf = NULL;
 	ctrl->len = 0;
-	return dfu_submit_urb(ctrl);
+	return dfu_submit_urb(ctrl, urb_timeout);
 }
 
 static inline unsigned int altrim(unsigned int v, int sf)
@@ -124,13 +124,13 @@ static inline unsigned int altrim(unsigned int v, int sf)
 
 static int dfu_open(struct inode *inode, struct file *filp)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 	int state, retv, buflen;
 	struct dfu_control *ctrl;
 	void *datbuf;
 
 	retv = 0;
-	dfudev = container_of(inode->i_cdev, struct dfu_device, cdev);
+	dfudev = container_of(inode->i_cdev, struct dfu1_device, cdev);
 	filp->private_data = dfudev;
 	if (mutex_lock_interruptible(&dfudev->lock))
 		return -EBUSY;
@@ -155,7 +155,11 @@ static int dfu_open(struct inode *inode, struct file *filp)
 	
 	dfudev->stctrl = dfudev->opctrl + 1;
 	dfudev->stctrl->datbuf = NULL;
-	dfudev->stctrl->dfurb = dfudev->opctrl->dfurb;
+	dfudev->stctrl->dfurb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!dfudev->stctrl->dfurb) {
+		retv = -ENOMEM;
+		goto err_25;
+	}
 	dfudev->stctrl->usbdev = dfudev->usbdev;
 	dfudev->stctrl->intf = dfudev->intf;
 	dfudev->stctrl->intfnum = dfudev->intfnum;
@@ -172,6 +176,8 @@ static int dfu_open(struct inode *inode, struct file *filp)
 
 err_30:
 	usb_free_urb(dfudev->stctrl->dfurb);
+err_25:
+	usb_free_urb(dfudev->opctrl->dfurb);
 err_20:
 	kfree(datbuf);
 err_10:
@@ -181,7 +187,7 @@ err_10:
 
 static int dfu_release(struct inode *inode, struct file *filp)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 	struct dfu_control *stctrl;
 	int retv;
 
@@ -200,6 +206,7 @@ static int dfu_release(struct inode *inode, struct file *filp)
 		dev_err(&dfudev->intf->dev, "Need Reset! Stuck in State: %d\n",
 				retv);
 	usb_free_urb(stctrl->dfurb);
+	usb_free_urb(dfudev->opctrl->dfurb);
 	kfree(dfudev->datbuf);
 	mutex_unlock(&dfudev->lock);
 	filp->private_data = NULL;
@@ -209,7 +216,7 @@ static int dfu_release(struct inode *inode, struct file *filp)
 static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 			loff_t *f_pos)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 	int blknum, numb;
 	struct dfu_control *opctrl, *stctrl;
 	int dfust, dma, len;
@@ -219,9 +226,6 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	if (count == 0)
 		return 0;
 	dfudev = filp->private_data;
-	if (count % dfudev->xfersize != 0)
-		return -EINVAL;
-		
 	opctrl = dfudev->opctrl;
 	stctrl = dfudev->stctrl;
 	dfust = dfu_get_state(stctrl);
@@ -245,11 +249,12 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	opctrl->pipe = usb_rcvctrlpipe(dfudev->usbdev, 0);
 	opctrl->len = dfudev->xfersize;
 	if (dfudev->dma) {
-		dmabuf = dma_map_single(ctrler, opctrl->datbuf, dfudev->xfersize,
-					DMA_FROM_DEVICE);
+		dmabuf = dma_map_single(ctrler, opctrl->datbuf,
+				dfudev->xfersize, DMA_FROM_DEVICE);
 		if (!dma_mapping_error(ctrler, dmabuf)) {
 			dma = 1;
-			opctrl->dfurb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+			opctrl->dfurb->transfer_flags |=
+						URB_NO_TRANSFER_DMA_MAP;
 			opctrl->dfurb->transfer_dma = dmabuf;
 		} else
 			dev_warn(&dfudev->intf->dev,
@@ -260,7 +265,8 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	numb = 0;
 	do {
 		opctrl->req.wValue = cpu_to_le16(blknum);
-		if (dfu_submit_urb(opctrl) || dfu_get_status(stctrl))
+		if (dfu_submit_urb(opctrl, urb_timeout) ||
+				dfu_get_status(stctrl))
 			break;
 		dfust = stctrl->dfuStatus.bState;
 		if (dfust != dfuUPLOAD_IDLE && dfust != dfuIDLE) {
@@ -271,16 +277,16 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 		len = READ_ONCE(opctrl->nxfer);
 		if (len == 0)
 			break;
+		*f_pos += len;
+		blknum = *f_pos / BLKSIZE;
 		dma_sync_single_for_cpu(ctrler, dmabuf, len, DMA_FROM_DEVICE);
 		if (copy_to_user(buff+numb, opctrl->datbuf, len)) {
 			dev_err(&dfudev->intf->dev,
-				"Failed to copy into user space!\n");
+				"Failed to copy data into user space!\n");
 			break;
 		}
 		numb += len;
-		blknum += len / BLKSIZE;
-	} while (len == opctrl->len && numb < count);
-	*f_pos += numb;
+	} while (numb < count && dfust == dfuUPLOAD_IDLE);
 
 	if (dma)
 		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
@@ -292,8 +298,8 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 			size_t count, loff_t *f_pos)
 {
-	struct dfu_device *dfudev;
-	int blknum, numb;
+	struct dfu1_device *dfudev;
+	int blknum, numb, fpos;
 	struct dfu_control *opctrl, *stctrl;
 	int dfust, dma, len, lenrem, tmout;
 	dma_addr_t dmabuf;
@@ -302,9 +308,6 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 	if (count == 0)
 		return 0;
 	dfudev = filp->private_data;
-	if (count % dfudev->xfersize != 0)
-		return -EINVAL;
-
 	opctrl = dfudev->opctrl;
 	stctrl = dfudev->stctrl;
 	dfust = dfu_get_state(stctrl);
@@ -334,7 +337,8 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 					"Cannot map DMA address\n");
 	}
 
-	blknum = *f_pos / BLKSIZE;
+	fpos = *f_pos;
+	blknum = fpos / BLKSIZE;
 	lenrem = count;
 	numb = 0;
 	do {
@@ -346,12 +350,16 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 		opctrl->req.wLength = cpu_to_le16(opctrl->len);
 		dma_sync_single_for_device(ctrler, dmabuf, opctrl->len,
 						DMA_TO_DEVICE);
-		if (dfu_submit_urb(opctrl) || dfu_get_status(stctrl))
+		if (dfu_submit_urb(opctrl, urb_timeout) ||
+				dfu_get_status(stctrl))
 			break;
 		len = READ_ONCE(opctrl->nxfer);
+		if (len == 0)
+			break;
 		numb += len;
 		lenrem -= len;
-		blknum += len / BLKSIZE;
+		fpos += len;
+		blknum = fpos / BLKSIZE;
 		while (stctrl->dfuStatus.bState == dfuDNLOAD_BUSY) {
 			tmout = stctrl->dfuStatus.wmsec[0] |
 					(stctrl->dfuStatus.wmsec[1] << 8) |
@@ -366,8 +374,9 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 				"Downloading failed. DFU State: %d\n", dfust);
 			break;
 		}
-	} while (len == opctrl->len && lenrem > 0);
-	*f_pos += numb;
+	} while (lenrem > 0);
+	if (*f_pos != 0 || numb > 32)
+		*f_pos += numb;
 
 	if (dma)
 		dma_unmap_single(ctrler, dmabuf, dfudev->xfersize,
@@ -387,13 +396,13 @@ static const struct file_operations dfu_fops = {
 static ssize_t dfu_sndcmd(struct device *dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 	struct dfu_control *ctrl;
 
-	if (count < 4 || count > 32)
+	if (count < 1 || count > 32)
 		return count;
 
-	dfudev = container_of(attr, struct dfu_device, tachattr);
+	dfudev = container_of(attr, struct dfu1_device, tachattr);
 	if (!mutex_trylock(&dfudev->lock)) {
 		dev_err(&dfudev->intf->dev,
 				"Cannot send command, device busy\n");
@@ -420,7 +429,8 @@ static ssize_t dfu_sndcmd(struct device *dev, struct device_attribute *attr,
 	ctrl->datbuf = ctrl + 1;
 	memcpy(ctrl->datbuf, buf, count);
 	ctrl->len = count;
-	if (dfu_submit_urb(ctrl) || dfu_get_status(ctrl))
+	if (dfu_submit_urb(ctrl, urb_timeout) ||
+			dfu_get_status(ctrl))
 		dev_err(&dfudev->intf->dev,
 				"DFU command failed: %d, State: %d\n",
 				(int)ctrl->dfuStatus.bStatus,
@@ -439,9 +449,9 @@ static ssize_t dfu_sndcmd(struct device *dev, struct device_attribute *attr,
 static ssize_t dfu_attr_show(struct device *dev, struct device_attribute *attr,
 			char *buf)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 
-	dfudev = container_of(attr, struct dfu_device, attrattr);
+	dfudev = container_of(attr, struct dfu1_device, attrattr);
 	return sprintf(buf, "Download:%d Upload:%d Manifest:%d Detach:%d\n",
 		dfudev->download, dfudev->upload, dfudev->manifest,
 		dfudev->detach);
@@ -450,32 +460,32 @@ static ssize_t dfu_attr_show(struct device *dev, struct device_attribute *attr,
 static ssize_t dfu_timeout_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 
-	dfudev = container_of(attr, struct dfu_device, tmoutattr);
+	dfudev = container_of(attr, struct dfu1_device, tmoutattr);
 	return sprintf(buf, "%d\n", dfudev->dettmout);
 }
 
 static ssize_t dfu_xfersize_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 
-	dfudev = container_of(attr, struct dfu_device, xsizeattr);
+	dfudev = container_of(attr, struct dfu1_device, xsizeattr);
 	return sprintf(buf, "%d\n", dfudev->xfersize);
 }
 
 static ssize_t dfu_state_show(struct device *dev, struct device_attribute *attr,
 			char *buf)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 	struct dfu_control *ctrl;
 	int dfstat;
 
 	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
 	if (!ctrl)
 		return -ENOMEM;
-	dfudev = container_of(attr, struct dfu_device, statattr);
+	dfudev = container_of(attr, struct dfu1_device, statattr);
 	ctrl->dfurb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!ctrl->dfurb) {
 		kfree(ctrl);
@@ -490,7 +500,7 @@ static ssize_t dfu_state_show(struct device *dev, struct device_attribute *attr,
 	return sprintf(buf, "%d\n", dfstat);
 }
 
-static ssize_t stellaris_show(struct dfu_device *dfudev,
+static ssize_t stellaris_show(struct dfu1_device *dfudev,
 			struct dfu_control *ctrl, char *buf)
 {
 	struct tidfu {
@@ -509,7 +519,7 @@ static ssize_t stellaris_show(struct dfu_device *dfudev,
 	ctrl->datbuf = ctrl->ocupy;
 	ctrl->len = sizeof(struct tidfu);
 	stellaris = ctrl->datbuf;
-	if (dfu_submit_urb(ctrl) == 0) {
+	if (dfu_submit_urb(ctrl, urb_timeout) == 0) {
 		usMarker = le16_to_cpu(stellaris->usMarker);
 		usVersion = le16_to_cpu(stellaris->usVersion);
 		num = sprintf(buf, "Stellaris Marker: %4.4X, Version: %4.4X\n",
@@ -521,12 +531,12 @@ static ssize_t stellaris_show(struct dfu_device *dfudev,
 static ssize_t dfu_query_show(struct device *dev, struct device_attribute *attr,
 			char *buf)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 	struct dfu_control *ctrl;
 	unsigned short idVendor, idProduct;
 	ssize_t numbytes;
 
-	dfudev = container_of(attr, struct dfu_device, queryattr);
+	dfudev = container_of(attr, struct dfu1_device, queryattr);
 	idVendor = le16_to_cpu(dfudev->usbdev->descriptor.idVendor);
 	idProduct = le16_to_cpu(dfudev->usbdev->descriptor.idProduct);
 	ctrl = kmalloc(sizeof(struct dfu_control), GFP_KERNEL);
@@ -553,12 +563,12 @@ static ssize_t dfu_query_show(struct device *dev, struct device_attribute *attr,
 static ssize_t dfu_clear_cmd(struct device *dev, struct device_attribute *attr,
 			const char *buf, size_t count)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 	struct dfu_control *ctrl;
 	int dfust;
 
-	dfudev = container_of(attr, struct dfu_device, abortattr);
-	if (*buf != '1') {
+	dfudev = container_of(attr, struct dfu1_device, abortattr);
+	if (count < 1 || *buf != '1') {
 		dev_warn(&dfudev->intf->dev, "Invalid command: %c\n", *buf);
 		return count;
 	}
@@ -594,7 +604,7 @@ static ssize_t dfu_clear_cmd(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static int dfu_create_attrs(struct dfu_device *dfudev)
+static int dfu_create_attrs(struct dfu1_device *dfudev)
 {
 	int retv = 0;
 
@@ -686,7 +696,7 @@ err_10:
 	return retv;
 }
 
-static void dfu_remove_attrs(struct dfu_device *dfudev)
+static void dfu_remove_attrs(struct dfu1_device *dfudev)
 {
 	device_remove_file(&dfudev->intf->dev, &dfudev->queryattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->abortattr);
@@ -704,8 +714,9 @@ static int dfu_probe(struct usb_interface *intf,
 			const struct usb_device_id *id)
 {
 	int retv, dfufdsc_len, index;
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 	struct dfufdsc *dfufdsc;
+	int i;
 
 	retv = 0;
 	dfufdsc = (struct dfufdsc *)intf->cur_altsetting->extra;
@@ -722,7 +733,7 @@ static int dfu_probe(struct usb_interface *intf,
 		retv = -ENODEV;
 		goto err_05;
 	}
-	dfudev = kmalloc(sizeof(struct dfu_device), GFP_KERNEL);
+	dfudev = kmalloc(sizeof(struct dfu1_device), GFP_KERNEL);
 	if (!dfudev) {
 		retv = -ENOMEM;
 		goto err_05;
@@ -747,10 +758,14 @@ static int dfu_probe(struct usb_interface *intf,
 	if (retv)
 		goto err_10;
 
-	int i;
         for (i = 0; i < max_dfus; i++)
                 if (!atomic_xchg(dev_minors+i, 1))
                         break;
+	if (i == max_dfus) {
+		retv = -EINVAL;
+		dev_err(&dfudev->intf->dev, "No minor usable, Logic Error\n");
+		goto err_15;
+	}
         dfudev->devno = MKDEV(MAJOR(dfu_devno), i);
 
 	cdev_init(&dfudev->cdev, &dfu_fops);
@@ -776,6 +791,7 @@ err_30:
 	cdev_del(&dfudev->cdev);
 err_20:
 	atomic_set(dev_minors+MINOR(dfudev->devno), 0);
+err_15:
 	dfu_remove_attrs(dfudev);
 err_10:
 	kfree(dfudev);
@@ -786,7 +802,7 @@ err_05:
 
 static void dfu_disconnect(struct usb_interface *intf)
 {
-	struct dfu_device *dfudev;
+	struct dfu1_device *dfudev;
 
 	dfudev = usb_get_intfdata(intf);
 	usb_set_intfdata(intf, NULL);
@@ -799,7 +815,7 @@ static void dfu_disconnect(struct usb_interface *intf)
 }
 
 static struct usb_driver dfu_driver = {
-	.name = "dfutiva",
+	.name = "dfusb1",
 	.probe = dfu_probe,
 	.disconnect = dfu_disconnect,
 	.id_table = dfu_ids,
