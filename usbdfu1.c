@@ -236,7 +236,7 @@ static ssize_t dfu_upload(struct file *filp, char __user *buff, size_t count,
 	if (*f_pos != 0 && dfust == dfuIDLE)
 		return 0;
 
-	if (!access_ok(VERIFY_WRITE, buff, count))
+	if (!access_ok(buff, count))
 		return -EFAULT;
 
 	ctrler = dfudev->usbdev->bus->controller;
@@ -315,7 +315,7 @@ static ssize_t dfu_dnload(struct file *filp, const char __user *buff,
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", dfust);
 		return -EINVAL;
 	}
-	if (!access_ok(VERIFY_READ, buff, count))
+	if (!access_ok(buff, count))
 		return -EFAULT;
 
 	ctrler = dfudev->usbdev->bus->controller;
