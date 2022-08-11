@@ -1,12 +1,6 @@
 ifneq ($(KERNELRELEASE),)
-#	obj-m := dfusb0.o
-#	dfusb0-objs := usbdfu0.o usbdfu.o
-	obj-m += dfusb1.o
-	dfusb1-objs := usbdfu1.o usbdfu.o
-
-#usbdfu0.o: usbdfu0.h usbdfu.h
-usbdfu1.o: usbdfu1.h usbdfu.h
-
+	obj-m += usbdfu.o
+	usbdfu-objs := usb_dfu.o
 else
 	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 	WDIR := $(shell pwd)
