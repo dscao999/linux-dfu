@@ -766,8 +766,15 @@ static ssize_t detach_store(struct device *dev,
 		dev_err(dev, "Cannot detach the DFU device: %d\n", resp);
 		goto exit_10;
 	}
-	if ((dfudev->cap & CAN_DETACH) == 0)
+	if ((dfudev->cap & CAN_DETACH) == 0) {
+		resp = dfu_get_state(dfudev);
+		if (resp != appDETACH) {
+			dev_err(dev, "DFU device is not in appDETACH state: %d\n",
+					resp);
+			goto exit_10;
+		}
 		usb_reset_device(dfudev->usbdev);
+	}
 exit_10:
 	mutex_unlock(&dfudev->lock);
 	return count;
@@ -828,7 +835,7 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	struct device *dev;
 	struct usb_interface *intf;
 	struct dfu_device *dfudev;
-	int state, pos, blknum, usb_resp, mwait, count, remlen;
+	int state, pos, usb_resp, mwait, count, remlen;
 	char *curbuf;
 
 	dev = container_of(kobj, struct device, kobj);
@@ -838,14 +845,20 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		dev_warn(dev, "has no upload capbility\n");
 		return 0;
 	}
+	if ((size % dfudev->xfersize) != 0) {
+		dev_err(&dfudev->intf->dev, "Buffer size: %lu is not a " \
+				"mutiple of DFU transfer size: %d\n",
+				size, dfudev->xfersize);
+		return -EINVAL;
+	}
 	pos = 0;
 	curbuf = buf;
 	remlen = size;
-	blknum = offset / dfudev->xfersize;
 	dfudev->prireq.bRequestType = USB_DFU_FUNC_UP;
 	dfudev->prireq.bRequest = USB_DFU_UPLOAD;
 	dfudev->prireq.wIndex = cpu_to_le16(dfudev->intfnum);
 	dfudev->prireq.wLength = cpu_to_le16(dfudev->xfersize);
+	dfudev->prireq.wValue = 0;
 
 	mutex_lock(&dfudev->lock);
 	state = dfu_get_state(dfudev);
@@ -856,11 +869,10 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", state);
 		goto exit_10;
 	}
-	if (offset % dfudev->xfersize != 0)
+	if ((offset % dfudev->xfersize) != 0)
 		dev_warn(dev, "Offset: %llu not a multiple of transfer size: " \
 				"%d\n", offset, dfudev->xfersize);
 	while (remlen > dfudev->xfersize) {
-		dfudev->prireq.wValue = cpu_to_le16(blknum);
 		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout,
 				curbuf, remlen);
 		if (usb_resp) {
@@ -873,7 +885,6 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		pos += dfudev->nxfer;
 		curbuf += dfudev->nxfer;
 		remlen -= dfudev->nxfer;
-		blknum += 1;
 		count = 0;
 		do {
 			usb_resp = dfu_get_status(dfudev);
@@ -895,7 +906,6 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 			goto exit_10;
 		}
 	}
-	dfudev->prireq.wValue = cpu_to_le16(blknum);
 	dfudev->prireq.wLength = cpu_to_le16(remlen);
 	usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout, curbuf, remlen);
 	if (usb_resp) {
