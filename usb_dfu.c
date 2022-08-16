@@ -121,17 +121,12 @@ static void dfu_urb_timeout(struct dfu_device *dfudev)
 	wait_for_completion(&dfudev->urbdone);
 }
 
-int dfu_submit_urb(struct dfu_device *dfudev, int primary, int tmout,
-		void *datbuf, int buflen)
+int dfu_submit_urb(struct dfu_device *dfudev, struct usb_ctrlrequest *req,
+	       	int tmout, void *datbuf, int buflen)
 {
 	int retusb, retv, pipe;
 	unsigned long jiff_wait;
-	struct usb_ctrlrequest *req;
 
-	if (primary)
-		req = &dfudev->prireq;
-	else
-		req = &dfudev->auxreq;
 	pipe = -1;
 	if (req->bRequestType == USB_DFU_FUNC_DOWN)
 		pipe = usb_sndctrlpipe(dfudev->usbdev, 0);
@@ -207,7 +202,7 @@ static inline int dfu_abort(struct dfu_device *dfudev)
 	dfudev->auxreq.wIndex = cpu_to_le16(dfudev->intfnum);
 	dfudev->auxreq.wValue = 0;
 	dfudev->auxreq.wLength = 0;
-	return dfu_submit_urb(dfudev, 0, urb_timeout, NULL, 0);
+	return dfu_submit_urb(dfudev, &dfudev->auxreq, urb_timeout, NULL, 0);
 }
 
 static inline int dfu_detach(struct dfu_device *dfudev)
@@ -217,7 +212,7 @@ static inline int dfu_detach(struct dfu_device *dfudev)
 	dfudev->auxreq.wIndex = cpu_to_le16(dfudev->intfnum);
 	dfudev->auxreq.wValue = dfudev->dettmout > 5000? 5000 : dfudev->dettmout;
 	dfudev->auxreq.wLength = 0;
-	return dfu_submit_urb(dfudev, 0, urb_timeout, NULL, 0);
+	return dfu_submit_urb(dfudev, &dfudev->auxreq, urb_timeout, NULL, 0);
 }
 
 static inline int dfu_get_status(struct dfu_device *dfudev)
@@ -227,7 +222,7 @@ static inline int dfu_get_status(struct dfu_device *dfudev)
 	dfudev->auxreq.wIndex = cpu_to_le16(dfudev->intfnum);
 	dfudev->auxreq.wValue = 0;
 	dfudev->auxreq.wLength = cpu_to_le16(6);
-	return dfu_submit_urb(dfudev, 0, urb_timeout,
+	return dfu_submit_urb(dfudev, &dfudev->auxreq, urb_timeout,
 			&dfudev->status, sizeof(dfudev->status));
 }
 
@@ -240,7 +235,7 @@ static inline int dfu_get_state(struct dfu_device *dfudev)
 	dfudev->auxreq.wIndex = cpu_to_le16(dfudev->intfnum);
 	dfudev->auxreq.wValue = 0;
 	dfudev->auxreq.wLength = cpu_to_le16(1);
-	retv = dfu_submit_urb(dfudev, 0, urb_timeout,
+	retv = dfu_submit_urb(dfudev, &dfudev->auxreq, urb_timeout,
 			&dfudev->state, sizeof(dfudev->state));
 	if (retv == 0)
 		retv = dfudev->state;
@@ -254,7 +249,7 @@ static inline int dfu_clr_status(struct dfu_device *dfudev)
 	dfudev->auxreq.wIndex = cpu_to_le16(dfudev->intfnum);
 	dfudev->auxreq.wValue = 0;
 	dfudev->auxreq.wLength = 0;
-	return dfu_submit_urb(dfudev, 0, urb_timeout, NULL, 0);
+	return dfu_submit_urb(dfudev, &dfudev->auxreq, urb_timeout, NULL, 0);
 }
 
 static inline int dfu_finish_dnload(struct dfu_device *dfudev)
@@ -264,7 +259,7 @@ static inline int dfu_finish_dnload(struct dfu_device *dfudev)
 	dfudev->prireq.wIndex = cpu_to_le16(dfudev->intfnum);
 	dfudev->prireq.wValue = 0;
 	dfudev->prireq.wLength = 0;
-	return dfu_submit_urb(dfudev, 1, urb_timeout, NULL, 0);
+	return dfu_submit_urb(dfudev, &dfudev->prireq, urb_timeout, NULL, 0);
 }
 
 /*static int dfu_open(struct inode *inode, struct file *filp)
@@ -943,7 +938,7 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	while (remlen > dfudev->xfersize && offset + pos < fm_size &&
 			dfu_state == dfuUPLOAD_IDLE) {
 		dfudev->prireq.wValue = cpu_to_le16(blknum);
-		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout,
+		usb_resp = dfu_submit_urb(dfudev, &dfudev->prireq, urb_timeout,
 				curbuf, dfudev->xfersize);
 		if (usb_resp) {
 			dev_err(dev, "DFU upload error: %d\n", usb_resp);
@@ -971,7 +966,8 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	BUG_ON(remlen == 0);
 	dfudev->prireq.wValue = cpu_to_le16(blknum);
 	dfudev->prireq.wLength = cpu_to_le16(remlen);
-	usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout, curbuf, remlen);
+	usb_resp = dfu_submit_urb(dfudev, &dfudev->prireq, urb_timeout,
+			curbuf, remlen);
 	if (usb_resp) {
 		dev_err(dev, "DFU upload error: %d\n", usb_resp);
 		pos = usb_resp;
@@ -1044,7 +1040,7 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 	while (remlen > dfudev->xfersize && offset + pos < fm_size &&
 			dfu_state == dfuDNLOAD_IDLE) {
 		dfudev->prireq.wValue = cpu_to_le16(blknum);
-		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout,
+		usb_resp = dfu_submit_urb(dfudev, &dfudev->prireq, urb_timeout,
 				curbuf, dfudev->xfersize);
 		if (usb_resp) {
 			dev_err(dev, "DFU download error: %d\n", usb_resp);
@@ -1067,7 +1063,8 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 		BUG_ON(remlen == 0);
 		dfudev->prireq.wValue = cpu_to_le16(blknum);
 		dfudev->prireq.wLength = cpu_to_le16(remlen);
-		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout, curbuf, remlen);
+		usb_resp = dfu_submit_urb(dfudev, &dfudev->prireq, urb_timeout,
+				curbuf, remlen);
 		if (usb_resp) {
 			dev_err(dev, "DFU download error: %d\n", usb_resp);
 			pos = usb_resp;
@@ -1080,7 +1077,8 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 	if (offset + pos == fm_size) {
 		dfudev->prireq.wValue = cpu_to_le16(blknum+1);
 		dfudev->prireq.wLength = 0;
-		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout, NULL, 0);
+		usb_resp = dfu_submit_urb(dfudev, &dfudev->prireq, urb_timeout,
+				NULL, 0);
 		if (usb_resp) {
 			dev_err(dev, "DFU download error: %d\n", usb_resp);
 			pos = usb_resp;
