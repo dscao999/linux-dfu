@@ -41,6 +41,8 @@
 #define CAN_MANIFEST	4
 #define CAN_DETACH	8
 
+#define MAX_FMSIZE	(0x7ful << 56)
+
 struct dfufdsc {
 	__u8 len;
 	__u8 dsctyp;
@@ -85,8 +87,20 @@ struct dfu_device {
 	int xfersize;
 	int proto;
 	int dma;
+	int polltmout;
 	volatile int resp;
 	struct dfu_status status;
+	union {
+		unsigned char attrs;
+		struct {
+			unsigned int detach_attr:1;
+			unsigned int capbility_attr:1;
+			unsigned int abort_attr:1;
+			unsigned int firmware_attr:1;
+			unsigned int fmsize_attr:1;
+			unsigned int status_attr:1;
+		};
+	};
 	__u8 cap;
 	__u8 state;
 };
@@ -146,13 +160,10 @@ int dfu_submit_urb(struct dfu_device *dfudev, int primary, int tmout,
 		return dfudev->resp;
 	}
 	retv = READ_ONCE(dfudev->resp);
-	if (retv && (retv != -EPROTO ||
-				req->bRequest != USB_DFU_DETACH ||
-				(dfudev->cap & CAN_DETACH) == 0)) {
+	if (retv)
 		dev_err(&dfudev->intf->dev,
 			"URB type: %2.2x, req: %2.2x request failed: %d\n",
 			(int)req->bRequestType, (int)req->bRequest, retv);
-	}
 
 	return retv;
 }
@@ -736,6 +747,54 @@ static ssize_t dfu_clear_cmd(struct device *dev, struct device_attribute *attr,
 	return count;
 } */
 
+int dfu_wait_state(struct dfu_device *dfudev, int state_mask)
+{
+	int count = 0, usb_resp, mwait;
+
+	state_mask |= (1<<dfuERROR);
+	do {
+		usb_resp = dfu_get_status(dfudev);
+		if (usb_resp) {
+			dev_err(&dfudev->intf->dev, "Cannot get DFU status: " \
+					"%d\n", usb_resp);
+			return usb_resp;
+		}
+		mwait = dfudev->status.wmsec[2]<<16|
+			dfudev->status.wmsec[1]<<8|
+			dfudev->status.wmsec[0];
+		msleep(mwait);
+		count += 1;
+	} while (((1<<dfudev->status.bState) & state_mask) == 0 && count < 5);
+	if (count == 5)
+		dev_err(&dfudev->intf->dev, "DFU Stalled\n");
+	return dfudev->status.bState;
+}
+static ssize_t abort_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dfu_device *dfudev;
+	struct usb_interface *intf;
+	char *strbuf;
+
+	if (count != 3 || memcmp(buf, "xxx", 3) != 0) {
+		strbuf = kmalloc(count+1, GFP_KERNEL);
+		if (!strbuf) {
+			dev_err(dev, "Out of Memory\n");
+			return count;
+		}
+		memcpy(strbuf, buf, count);
+		strbuf[count] = 0;
+		dev_err(dev, "Invalid Detach Token: %s\n", strbuf);
+		kfree(strbuf);
+		return count;
+	}
+
+	intf = container_of(dev, struct usb_interface, dev);
+	dfudev = usb_get_intfdata(intf);
+	dfu_abort(dfudev);
+	return count;
+}
+
 static ssize_t detach_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -830,13 +889,20 @@ static ssize_t status_show(struct device *dev,
 
 ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		struct bin_attribute *binattr, 
-		char *buf, loff_t offset, size_t size)
+		char *buf, loff_t offset, size_t bufsz)
 {
 	struct device *dev;
 	struct usb_interface *intf;
 	struct dfu_device *dfudev;
-	int state, pos, usb_resp, mwait, count, remlen;
+	int pos, usb_resp, remlen, dfu_state, blknum, state_mask;
+	unsigned long fm_size;
 	char *curbuf;
+
+	if (unlikely(bufsz == 0))
+		return bufsz;
+	fm_size = binattr->size;
+	if (fm_size == 0)
+		fm_size = MAX_FMSIZE;
 
 	dev = container_of(kobj, struct device, kobj);
 	intf = container_of(dev, struct usb_interface, dev);
@@ -845,74 +911,79 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		dev_warn(dev, "has no upload capbility\n");
 		return 0;
 	}
-	if ((size % dfudev->xfersize) != 0) {
+	if ((bufsz % dfudev->xfersize) != 0) {
 		dev_err(&dfudev->intf->dev, "Buffer size: %lu is not a " \
 				"mutiple of DFU transfer size: %d\n",
-				size, dfudev->xfersize);
+				bufsz, dfudev->xfersize);
 		return -EINVAL;
 	}
 	pos = 0;
 	curbuf = buf;
-	remlen = size;
+	remlen = offset + bufsz <= fm_size? bufsz : fm_size - offset;
 	dfudev->prireq.bRequestType = USB_DFU_FUNC_UP;
 	dfudev->prireq.bRequest = USB_DFU_UPLOAD;
 	dfudev->prireq.wIndex = cpu_to_le16(dfudev->intfnum);
 	dfudev->prireq.wLength = cpu_to_le16(dfudev->xfersize);
-	dfudev->prireq.wValue = 0;
+	blknum = offset / dfudev->xfersize;
 
 	mutex_lock(&dfudev->lock);
-	state = dfu_get_state(dfudev);
-	if (offset > 0 && state == dfuIDLE)
+	dfu_state = dfu_get_state(dfudev);
+	if (offset > 0 && dfu_state == dfuIDLE)
 		goto exit_10;
-	if ((offset == 0 && state != dfuIDLE) ||
-			(offset > 0 && state != dfuUPLOAD_IDLE)) {
-		dev_err(&dfudev->intf->dev, "Inconsistent State: %d\n", state);
+	if ((offset == 0 && dfu_state != dfuIDLE) ||
+			(offset > 0 && dfu_state != dfuUPLOAD_IDLE)) {
+		dev_err(&dfudev->intf->dev, "Incompatible State for " \
+				"uploading: %d, Offset: %lld\n",
+				dfu_state, offset);
+		pos = -EPROTO;
 		goto exit_10;
 	}
-	if ((offset % dfudev->xfersize) != 0)
-		dev_warn(dev, "Offset: %llu not a multiple of transfer size: " \
-				"%d\n", offset, dfudev->xfersize);
-	while (remlen > dfudev->xfersize) {
+	dfu_state = dfuUPLOAD_IDLE;
+	state_mask = (1<<dfuUPLOAD_IDLE|1<<dfuIDLE);
+	while (remlen > dfudev->xfersize && offset + pos < fm_size &&
+			dfu_state == dfuUPLOAD_IDLE) {
+		dfudev->prireq.wValue = cpu_to_le16(blknum);
 		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout,
-				curbuf, remlen);
+				curbuf, dfudev->xfersize);
 		if (usb_resp) {
 			dev_err(dev, "DFU upload error: %d\n", usb_resp);
 			pos = usb_resp;
 			goto exit_10;
 		}
-		if (dfudev->nxfer == 0)
-			goto exit_10;
+		WARN_ON(dfudev->nxfer == 0);
 		pos += dfudev->nxfer;
 		curbuf += dfudev->nxfer;
 		remlen -= dfudev->nxfer;
-		count = 0;
-		do {
-			usb_resp = dfu_get_status(dfudev);
-			if (usb_resp) {
-				dev_err(dev, "Cannot get DFU upload status: %d\n",
-						usb_resp);
-				goto exit_10;
-			}
-			mwait = dfudev->status.wmsec[2]<<16|
-				dfudev->status.wmsec[1]<<8|
-				dfudev->status.wmsec[0];
-			if (dfudev->status.bState == dfuIDLE)
-				goto exit_10;
-			msleep(mwait);
-			count += 1;
-		} while (dfudev->status.bState != dfuUPLOAD_IDLE && count < 3);
-		if (count == 3) {
-			dev_err(dev, "DFU Stalled\n");
-			goto exit_10;
-		}
+		blknum += 1;
+		dfu_state = dfu_wait_state(dfudev, state_mask);
 	}
+	if (dfu_state == dfuIDLE)
+		goto exit_10;
+	if (unlikely(dfu_state != dfuUPLOAD_IDLE)) {
+		dev_err(&dfudev->intf->dev, "Cannot continue uploading, " \
+				"inconsistent state: %d\n", dfu_state);
+		goto exit_10;
+	}
+	if (offset + pos == fm_size) {
+		dfu_abort(dfudev);
+		goto exit_10;
+	}
+	BUG_ON(remlen == 0);
+	dfudev->prireq.wValue = cpu_to_le16(blknum);
 	dfudev->prireq.wLength = cpu_to_le16(remlen);
 	usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout, curbuf, remlen);
 	if (usb_resp) {
 		dev_err(dev, "DFU upload error: %d\n", usb_resp);
 		pos = usb_resp;
-	} else
-		pos += dfudev->nxfer;
+		goto exit_10;
+	}
+	WARN_ON(dfudev->nxfer == 0);
+	pos += dfudev->nxfer;
+	dfu_state = dfu_wait_state(dfudev, state_mask);
+	if (offset + pos == fm_size) {
+		if (dfu_state == dfuUPLOAD_IDLE)
+			dfu_abort(dfudev);
+	}
 
 exit_10:
 	mutex_unlock(&dfudev->lock);
@@ -921,40 +992,200 @@ exit_10:
 
 ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 		struct bin_attribute *binattr,
-		char *buf, loff_t pos, size_t size)
+		char *buf, loff_t offset, size_t bufsize)
 {
-	return size;
+	struct device *dev;
+	struct usb_interface *intf;
+	struct dfu_device *dfudev;
+	int dfu_state, pos, usb_resp, remlen, blknum, state_mask;
+	unsigned long fm_size;
+	char *curbuf;
+
+	if (unlikely(bufsize == 0))
+		return 0;
+	fm_size = binattr->size;
+	if (fm_size == 0) {
+		dev_err(dev, "The image size of DFU Device is unspecified. " \
+				"Cannot program the device\n");
+		return -EINVAL;
+	}
+
+	dev = container_of(kobj, struct device, kobj);
+	intf = container_of(dev, struct usb_interface, dev);
+	dfudev = usb_get_intfdata(intf);
+	if ((dfudev->cap & CAN_DOWNLOAD) == 0) {
+		dev_err(dev, "DFU Device has no download capbility\n");
+		return -EINVAL;
+	}
+	if (offset == fm_size && bufsize > 0) {
+		dev_err(dev, "Cannot program past the end of image. " \
+				"Current offset: %lld\n", offset);
+		return -EINVAL;
+	}
+	pos = 0;
+	remlen = offset + bufsize <= fm_size? bufsize : fm_size - offset;
+	curbuf = buf;
+	dfudev->prireq.bRequestType = USB_DFU_FUNC_DOWN;
+	dfudev->prireq.bRequest = USB_DFU_DNLOAD;
+	dfudev->prireq.wIndex = cpu_to_le16(dfudev->intfnum);
+	dfudev->prireq.wLength = cpu_to_le16(dfudev->xfersize);
+	blknum = offset / dfudev->xfersize;
+	mutex_lock(&dfudev->lock);
+	dfu_state = dfu_get_state(dfudev);
+	if ((offset == 0 && dfu_state != dfuIDLE) ||
+			(offset > 0 && dfu_state != dfuDNLOAD_IDLE)) {
+		dev_err(dev, "Inconsistent DFU State, offset: %lld " \
+				"State: %d\n", offset, dfu_state);
+		pos = -EPROTO;
+		goto exit_10;
+	}
+	dfu_state = dfuDNLOAD_IDLE;
+	state_mask = (1 << dfuDNLOAD_IDLE);
+	while (remlen > dfudev->xfersize && offset + pos < fm_size &&
+			dfu_state == dfuDNLOAD_IDLE) {
+		dfudev->prireq.wValue = cpu_to_le16(blknum);
+		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout,
+				curbuf, dfudev->xfersize);
+		if (usb_resp) {
+			dev_err(dev, "DFU download error: %d\n", usb_resp);
+			pos = usb_resp;
+			goto exit_10;
+		}
+		WARN_ON(dfudev->nxfer == 0);
+		pos += dfudev->nxfer;
+		curbuf += dfudev->nxfer;
+		remlen -= dfudev->nxfer;
+		blknum += 1;
+		dfu_state = dfu_wait_state(dfudev, state_mask);
+	}
+	if (unlikely(dfu_state != dfuDNLOAD_IDLE)) {
+		dev_err(&dfudev->intf->dev, "Cannot continue downloading. " \
+				"Invalid state: %d\n", dfu_state);
+		goto exit_10;
+	}
+	if (offset + pos < fm_size) {
+		BUG_ON(remlen == 0);
+		dfudev->prireq.wValue = cpu_to_le16(blknum);
+		dfudev->prireq.wLength = cpu_to_le16(remlen);
+		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout, curbuf, remlen);
+		if (usb_resp) {
+			dev_err(dev, "DFU download error: %d\n", usb_resp);
+			pos = usb_resp;
+			goto exit_10;
+		}
+		WARN_ON(dfudev->nxfer == 0);
+		pos += dfudev->nxfer;
+		dfu_state = dfu_wait_state(dfudev, state_mask);
+	}
+	if (offset + pos == fm_size) {
+		dfudev->prireq.wValue = cpu_to_le16(blknum+1);
+		dfudev->prireq.wLength = 0;
+		usb_resp = dfu_submit_urb(dfudev, 1, urb_timeout, NULL, 0);
+		if (usb_resp) {
+			dev_err(dev, "DFU download error: %d\n", usb_resp);
+			pos = usb_resp;
+			goto exit_10;
+		}
+		state_mask = (1<<dfuMANIFEST)|(1<<dfuIDLE);
+		dfu_state = dfu_wait_state(dfudev, state_mask);
+		if (dfu_state == dfuIDLE)
+			goto exit_10;
+		msleep(dfudev->polltmout);
+		if (dfudev->cap & CAN_MANIFEST)
+			dfu_state = dfu_wait_state(dfudev, dfuIDLE);
+		else {
+			dfu_state = dfu_wait_state(dfudev,
+					(1<<dfuMANIFEST_WAIT_RESET));
+			if (dfu_state != dfuMANIFEST_WAIT_RESET)
+				dev_err(&dfudev->intf->dev, "Inconsistent " \
+						"state after downloading: %d\n",
+						dfu_state);
+			else
+				usb_reset_device(dfudev->usbdev);
+		}
+	}
+
+exit_10:
+	mutex_unlock(&dfudev->lock);
+	return pos;
 }
 
 static DEVICE_ATTR_WO(detach);
+static DEVICE_ATTR_WO(abort);
 static DEVICE_ATTR_RO(capbility);
 static DEVICE_ATTR_RO(status);
 static BIN_ATTR_RW(firmware, 0);
+
+static ssize_t fmsize_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%lu", bin_attr_firmware.size);
+}
+
+static ssize_t fmsize_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t buflen)
+{
+	char *tmpbuf, *endchr;
+
+	tmpbuf = kmalloc(buflen+1, GFP_KERNEL);
+	if (!tmpbuf) {
+		dev_err(dev, "Out of Memory\n");
+		return -ENOMEM;
+	}
+	memcpy(tmpbuf, buf, buflen);
+	tmpbuf[buflen] = 0;
+	bin_attr_firmware.size = simple_strtoul(tmpbuf, &endchr, 10);
+	kfree(tmpbuf);
+	return buflen;
+}
+
+static DEVICE_ATTR_RW(fmsize);
 
 static int dfu_create_attrs(struct dfu_device *dfudev)
 {
 	int retv;
 
+	dfudev->attrs = 0;
 	if (dfudev->proto == USB_DFU_PROTO_RUNTIME) {
 		retv = device_create_file(&dfudev->intf->dev, &dev_attr_detach);
-		if (retv != 0)
+		if (unlikely(retv != 0))
 			dev_warn(&dfudev->intf->dev,
 					"Cannot create sysfs file %d\n", retv);
+		else
+			dfudev->detach_attr = 1;
 	} else {
+		retv = device_create_file(&dfudev->intf->dev, &dev_attr_status);
+		if (unlikely(retv != 0))
+			dev_warn(&dfudev->intf->dev,
+					"Cannot create sysfs file %d\n", retv);
+		else
+			dfudev->status_attr = 1;
+		retv = device_create_file(&dfudev->intf->dev, &dev_attr_fmsize);
+		if (unlikely(retv != 0))
+			dev_warn(&dfudev->intf->dev,
+					"Cannot create sysfs file %d\n", retv);
+		else
+			dfudev->fmsize_attr = 1;
+		retv = device_create_file(&dfudev->intf->dev, &dev_attr_abort);
+		if (unlikely(retv != 0))
+			dev_warn(&dfudev->intf->dev,
+					"Cannot create sysfs file %d\n", retv);
+		else
+			dfudev->abort_attr = 1;
 		retv = sysfs_create_bin_file(&dfudev->intf->dev.kobj,
 				&bin_attr_firmware);
-		if (retv != 0)
+		if (unlikely(retv != 0))
 			dev_warn(&dfudev->intf->dev,
 					"Cannot create sysfs file %d\n", retv);
+		else
+			dfudev->firmware_attr = 1;
 	}
 	retv = device_create_file(&dfudev->intf->dev, &dev_attr_capbility);
-	if (retv != 0)
+	if (unlikely(retv != 0))
 		dev_warn(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
 				retv);
-	retv = device_create_file(&dfudev->intf->dev, &dev_attr_status);
-	if (retv != 0)
-		dev_warn(&dfudev->intf->dev, "Cannot create sysfs file %d\n",
-				retv);
+	else
+		dfudev->capbility_attr = 1;
 /*
 	dfudev->attrattr.attr.name = "attr";
 	dfudev->attrattr.attr.mode = 0444;
@@ -1033,13 +1264,18 @@ err_20:
 
 static void dfu_remove_attrs(struct dfu_device *dfudev)
 {
-	if (dfudev->proto == USB_DFU_PROTO_RUNTIME) {
+	if (dfudev->detach_attr)
 		device_remove_file(&dfudev->intf->dev, &dev_attr_detach);
-	} else {
+	if (dfudev->firmware_attr)
 		sysfs_remove_bin_file(&dfudev->intf->dev.kobj, &bin_attr_firmware);
-	}
-	device_remove_file(&dfudev->intf->dev, &dev_attr_capbility);
-	device_remove_file(&dfudev->intf->dev, &dev_attr_status);
+	if (dfudev->abort_attr)
+		device_remove_file(&dfudev->intf->dev, &dev_attr_abort);
+	if (dfudev->fmsize_attr)
+		device_remove_file(&dfudev->intf->dev, &dev_attr_fmsize);
+	if (dfudev->status_attr)
+		device_remove_file(&dfudev->intf->dev, &dev_attr_status);
+	if (dfudev->capbility_attr)
+		device_remove_file(&dfudev->intf->dev, &dev_attr_capbility);
 /*	device_remove_file(&dfudev->intf->dev, &dfudev->abortattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->statattr);
 	device_remove_file(&dfudev->intf->dev, &dfudev->xsizeattr);
@@ -1054,7 +1290,7 @@ static atomic_t *dev_minors; */
 static int dfu_probe(struct usb_interface *intf,
 			const struct usb_device_id *id)
 {
-	int retv, dfufdsc_len;
+	int retv, dfufdsc_len, resp;
 	struct dfu_device *dfudev;
 	struct dfufdsc *dfufdsc;
 
@@ -1091,9 +1327,17 @@ static int dfu_probe(struct usb_interface *intf,
 
         usb_set_intfdata(intf, dfudev);
 	dfu_create_attrs(dfudev);
-
-	dev_info(&dfudev->intf->dev, "USB DFU inserted, CAN: %02x PROTO: %d\n",
-			(int)dfudev->cap, dfudev->proto);
+	dfudev->polltmout = 0;
+	if (dfudev->proto == USB_DFU_PROTO_DFUMODE) {
+		resp = dfu_get_status(dfudev);
+		dfudev->polltmout = dfudev->status.wmsec[2]<<16|
+			dfudev->status.wmsec[1]<<8|
+			dfudev->status.wmsec[0];
+		if (dfudev->status.bState != dfuIDLE)
+			dev_warn(&dfudev->intf->dev, "Not in idle state: %d\n", dfudev->status.bState);
+	}
+	dev_info(&dfudev->intf->dev, "USB DFU inserted, CAN: %02x PROTO: %d, Poll Time Out: %d\n",
+			(int)dfudev->cap, dfudev->proto, dfudev->polltmout);
 	return retv;
 
 err_10:
