@@ -7,15 +7,12 @@
  *
  */
 
-#include <stdarg.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
-#include <linux/fs.h>
 #include <linux/dma-mapping.h>
-#include <linux/uaccess.h>
 
 #define USB_DFU_DETACH		0
 #define USB_DFU_DNLOAD		1
@@ -163,7 +160,6 @@ int dfu_submit_urb(struct dfu_device *dfudev, struct usb_ctrlrequest *req,
 	return retv;
 }
 
-#define BLKSIZE	1024
 #define DFUDEV_NAME "dfu"
 
 MODULE_LICENSE("GPL");
@@ -176,20 +172,21 @@ module_param(urb_timeout, int, 0644);
 MODULE_PARM_DESC(urb_timeout, "USB urb completion timeout. "
 	"Default: 200 milliseconds.");
 
-/*static const struct usb_device_id dfu_ids[] = {
-	{ USB_INTERFACE_INFO(USB_CLASS_APP_SPEC,
-			USB_DFU_SUBCLASS,
-			USB_DFU_PROTO_RUNTIME)
-	},
-	{ USB_INTERFACE_INFO(USB_CLASS_APP_SPEC,
-			USB_DFU_SUBCLASS,
-			USB_DFU_PROTO_DFUMODE)
-	},
-	{ }
-}; */
 static const struct usb_device_id dfu_ids[] = {
-	{ USB_DEVICE_INTERFACE_CLASS(0x1cbe, 0x00ff, USB_CLASS_APP_SPEC) },
-	{ USB_DEVICE_INTERFACE_CLASS(0x1cbe, 0x00fd, USB_CLASS_APP_SPEC) },
+	{	.match_flags = USB_DEVICE_ID_MATCH_VENDOR|
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x1cbe,
+		.bInterfaceClass = USB_CLASS_APP_SPEC,
+		.bInterfaceSubClass = USB_DFU_SUBCLASS,
+		.bInterfaceProtocol = USB_DFU_PROTO_RUNTIME
+	},
+	{	.match_flags = USB_DEVICE_ID_MATCH_VENDOR|
+			USB_DEVICE_ID_MATCH_INT_INFO,
+		.idVendor = 0x1cbe,
+		.bInterfaceClass = USB_CLASS_APP_SPEC,
+		.bInterfaceSubClass = USB_DFU_SUBCLASS,
+		.bInterfaceProtocol = USB_DFU_PROTO_DFUMODE
+	},
 	{}
 };
 
@@ -730,7 +727,6 @@ static int dfu_probe(struct usb_interface *intf,
 	struct dfu_device *dfudev;
 	struct dfufdsc *dfufdsc;
 
-	dev_info(&intf->dev, "DFU Probing called\n");
 	retv = 0;
 	dfufdsc = (struct dfufdsc *)intf->cur_altsetting->extra;
 	dfufdsc_len = intf->cur_altsetting->extralen;
@@ -792,7 +788,6 @@ static void dfu_disconnect(struct usb_interface *intf)
 	usb_free_urb(dfudev->urb);
 	mutex_unlock(&dfudev->lock);
 	kfree(dfudev);
-	dev_info(&dfudev->intf->dev,  "USB DFU removed\n");
 }
 
 static struct usb_driver dfu_driver = {
