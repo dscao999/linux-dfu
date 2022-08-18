@@ -84,7 +84,6 @@ struct dfu_device {
 	int xfersize;
 	int proto;
 	int dma;
-	int polltmout;
 	volatile int resp;
 	struct dfu_status status;
 	union {
@@ -259,7 +258,12 @@ static inline int dfu_finish_dnload(struct dfu_device *dfudev)
 	return dfu_submit_urb(dfudev, &dfudev->prireq, urb_timeout, NULL, 0);
 }
 
-int dfu_wait_state(struct dfu_device *dfudev, int state_mask)
+static inline int wmsec2int(unsigned char *wmsec)
+{
+	return (wmsec[2] << 16)|(wmsec[1] << 8) | wmsec[0];
+}
+
+static int dfu_wait_state(struct dfu_device *dfudev, int state_mask)
 {
 	int count = 0, usb_resp, mwait;
 
@@ -271,12 +275,12 @@ int dfu_wait_state(struct dfu_device *dfudev, int state_mask)
 					"%d\n", usb_resp);
 			return usb_resp;
 		}
-		mwait = dfudev->status.wmsec[2]<<16|
-			dfudev->status.wmsec[1]<<8|
-			dfudev->status.wmsec[0];
+		if (state_mask & (1 << dfudev->status.bState))
+			break;
+		mwait = wmsec2int(dfudev->status.wmsec);
 		msleep(mwait);
 		count += 1;
-	} while (((1<<dfudev->status.bState) & state_mask) == 0 && count < 5);
+	} while (count < 5);
 	if (count == 5)
 		dev_err(&dfudev->intf->dev, "DFU Stalled\n");
 	return dfudev->status.bState;
@@ -605,7 +609,7 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 		dfu_state = dfu_wait_state(dfudev, state_mask);
 		if (dfu_state == dfuIDLE)
 			goto exit_10;
-		msleep(dfudev->polltmout);
+		msleep(wmsec2int(dfudev->status.wmsec)+10);
 		if (dfudev->cap & CAN_MANIFEST)
 			dfu_state = dfu_wait_state(dfudev, dfuIDLE);
 		else {
@@ -759,17 +763,15 @@ static int dfu_probe(struct usb_interface *intf,
 
         usb_set_intfdata(intf, dfudev);
 	dfu_create_attrs(dfudev);
-	dfudev->polltmout = 0;
 	if (dfudev->proto == USB_DFU_PROTO_DFUMODE) {
 		resp = dfu_get_status(dfudev);
-		dfudev->polltmout = dfudev->status.wmsec[2]<<16|
-			dfudev->status.wmsec[1]<<8|
-			dfudev->status.wmsec[0];
 		if (dfudev->status.bState != dfuIDLE)
-			dev_warn(&dfudev->intf->dev, "Not in idle state: %d\n", dfudev->status.bState);
+			dev_warn(&dfudev->intf->dev, "Not in idle state: %d\n",
+					dfudev->status.bState);
 	}
-	dev_info(&dfudev->intf->dev, "USB DFU inserted, CAN: %02x PROTO: %d, Poll Time Out: %d\n",
-			(int)dfudev->cap, dfudev->proto, dfudev->polltmout);
+	dev_info(&dfudev->intf->dev, "USB DFU inserted, CAN: %02x PROTO: %d, " \
+			"Poll Time Out: %d\n", (int)dfudev->cap, dfudev->proto,
+			wmsec2int(dfudev->status.wmsec));
 	return retv;
 
 err_10:
