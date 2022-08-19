@@ -404,6 +404,19 @@ static ssize_t status_show(struct device *dev,
 }
 
 ssize_t firmware_read(struct file *filep, struct kobject *kobj,
+		struct bin_attribute *binattr,
+		char *buf, loff_t offset, size_t bufsz);
+ssize_t firmware_write(struct file *filep, struct kobject *kobj,
+		struct bin_attribute *binattr,
+		char *buf, loff_t offset, size_t bufsize);
+
+static DEVICE_ATTR_WO(detach);
+static DEVICE_ATTR_WO(abort);
+static DEVICE_ATTR_RO(capbility);
+static DEVICE_ATTR_RO(status);
+static BIN_ATTR_RW(firmware, 0);
+
+ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		struct bin_attribute *binattr, 
 		char *buf, loff_t offset, size_t bufsz)
 {
@@ -473,8 +486,10 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		blknum += 1;
 		dfu_state = dfu_wait_state(dfudev, state_mask);
 	}
-	if (dfu_state == dfuIDLE)
+	if (dfu_state == dfuIDLE) {
+		bin_attr_firmware.size = offset + pos;
 		goto exit_10;
+	}
 	if (unlikely(dfu_state != dfuUPLOAD_IDLE)) {
 		dev_err(&dfudev->intf->dev, "Cannot continue uploading, " \
 				"inconsistent state: %d\n", dfu_state);
@@ -497,10 +512,10 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	WARN_ON(dfudev->nxfer == 0);
 	pos += dfudev->nxfer;
 	dfu_state = dfu_wait_state(dfudev, state_mask);
-	if (offset + pos == fm_size) {
-		if (dfu_state == dfuUPLOAD_IDLE)
+	if (offset + pos == fm_size && dfu_state == dfuUPLOAD_IDLE)
 			dfu_abort(dfudev);
-	}
+	if (dfu_state == dfuIDLE)
+		bin_attr_firmware.size = offset + pos;
 
 exit_10:
 	mutex_unlock(&dfudev->lock);
@@ -631,12 +646,6 @@ exit_10:
 	mutex_unlock(&dfudev->lock);
 	return pos;
 }
-
-static DEVICE_ATTR_WO(detach);
-static DEVICE_ATTR_WO(abort);
-static DEVICE_ATTR_RO(capbility);
-static DEVICE_ATTR_RO(status);
-static BIN_ATTR_RW(firmware, 0);
 
 static ssize_t fmsize_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
