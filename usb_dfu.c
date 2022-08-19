@@ -238,7 +238,7 @@ static inline int dfu_get_state(struct dfu_device *dfudev)
 	return retv;
 }
 
-static inline int dfu_clr_status(struct dfu_device *dfudev)
+static inline int dfu_clear_status(struct dfu_device *dfudev)
 {
 	dfudev->auxreq.bRequestType = USB_DFU_FUNC_DOWN;
 	dfudev->auxreq.bRequest = USB_DFU_CLRSTATUS;
@@ -520,6 +520,7 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 
 	if (unlikely(bufsize == 0))
 		return 0;
+	dev = container_of(kobj, struct device, kobj);
 	fm_size = binattr->size;
 	if (fm_size == 0) {
 		dev_err(dev, "The image size of DFU Device is unspecified. " \
@@ -527,7 +528,6 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 		return -EINVAL;
 	}
 
-	dev = container_of(kobj, struct device, kobj);
 	intf = container_of(dev, struct usb_interface, dev);
 	dfudev = usb_get_intfdata(intf);
 	if ((dfudev->cap & CAN_DOWNLOAD) == 0) {
@@ -605,23 +605,26 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 			pos = usb_resp;
 			goto exit_10;
 		}
-		state_mask = (1<<dfuMANIFEST)|(1<<dfuIDLE);
+		state_mask = (1<<dfuIDLE)|(1<<dfuMANIFEST)|
+			(1<<dfuMANIFEST_WAIT_RESET);
 		dfu_state = dfu_wait_state(dfudev, state_mask);
 		if (dfu_state == dfuIDLE)
 			goto exit_10;
-		msleep(wmsec2int(dfudev->status.wmsec)+10);
-		if (dfudev->cap & CAN_MANIFEST)
-			dfu_state = dfu_wait_state(dfudev, dfuIDLE);
-		else {
-			dfu_state = dfu_wait_state(dfudev,
-					(1<<dfuMANIFEST_WAIT_RESET));
-			if (dfu_state != dfuMANIFEST_WAIT_RESET)
-				dev_err(&dfudev->intf->dev, "Inconsistent " \
-						"state after downloading: %d\n",
-						dfu_state);
-			else
-				usb_reset_device(dfudev->usbdev);
+		msleep(wmsec2int(dfudev->status.wmsec)+1);
+		dfu_state = dfu_wait_state(dfudev, state_mask);
+		if (dfu_state == dfuIDLE)
+			goto exit_10;
+		if (dfu_state == dfuMANIFEST_WAIT_RESET) {
+			usb_reset_device(dfudev->usbdev);
+			goto exit_10;
 		}
+		if (dfu_state == dfuERROR) {
+			dfu_clear_status(dfudev);
+			dev_warn(&dfudev->intf->dev, "State changed to " \
+					"dfuERROR. Error cleared\n");
+		} else
+			dev_warn(&dfudev->intf->dev, "Unexpected State after" \
+				       " firmware downloading\n");
 	}
 
 exit_10:
