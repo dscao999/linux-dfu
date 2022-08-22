@@ -74,7 +74,6 @@ struct dfu_device {
 	struct mutex lock;
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
-	struct device *sysdev;
 	struct usb_ctrlrequest prireq, auxreq;
 	struct completion urbdone;
 	struct urb *urb;
