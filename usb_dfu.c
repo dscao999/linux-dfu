@@ -14,6 +14,8 @@
 #include <linux/mutex.h>
 #include <linux/dma-mapping.h>
 
+#define MODULE_NAME	"subdfu"
+
 #define USB_DFU_DETACH		0
 #define USB_DFU_DNLOAD		1
 #define USB_DFU_UPLOAD		2
@@ -804,7 +806,7 @@ static void dfu_disconnect(struct usb_interface *intf)
 }
 
 static struct usb_driver dfu_driver = {
-	.name = "usbdfu",
+	.name = MODULE_NAME,
 	.probe = dfu_probe,
 	.disconnect = dfu_disconnect,
 	.id_table = dfu_ids,

@@ -1,8 +1,11 @@
 ifneq ($(KERNELRELEASE),)
 	obj-m += usbdfu.o
 	usbdfu-objs := usb_dfu.o
+
+	obj-m += usb_icdi.o
 else
-	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+	KERNVER ?= $(shell uname -r)
+	KERNELDIR ?= /lib/modules/$(KERNVER)/build
 	WDIR := $(shell pwd)
 
 all:
