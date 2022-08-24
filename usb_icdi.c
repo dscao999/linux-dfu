@@ -665,6 +665,55 @@ static DEVICE_ATTR_RW(fmsize); */
 #define FLASH_ERASE_SIZE 1024
 #define BUFSIZE (64 + 2*FLASH_BLOCK_SIZE)
 
+static inline int byte2hexstr(const unsigned char *bytes, int len,
+		char *buf, int buflen)
+{
+	char *curchr;
+	const unsigned char *curbyt;
+	unsigned char nibh, nibl;
+
+	if (buflen & 1)
+		buflen -= 1;
+	curchr = buf;
+	for (curbyt = bytes; curbyt < bytes + len && curchr < buf + buflen; curbyt++) {
+		nibh = (*curbyt) >> 4;
+		nibl = (*curbyt) & 0x0f;
+		*curchr++ = nibh > 9? 'a' + nibh - 10 : '0' + nibh;
+		*curchr++ = nibl > 9? 'a' + nibl - 10 : '0' + nibl;
+	}
+	return curchr - buf;
+}
+
+static inline unsigned char hexval(char hdigit)
+{
+	unsigned char v = 0;
+
+	v = 16;
+	if (hdigit >= 'a' && hdigit <= 'f')
+		v = hdigit - 'a' + 10;
+	else if (hdigit >= 'A' && hdigit <= 'F')
+		v = hdigit - 'A' + 10;
+	else if (hdigit >= '0' && hdigit <= '9')
+		v = hdigit - '0';
+	return v;
+}
+
+static inline int hexstr2byte(const char *hexstr, int len, unsigned char *buf, int buflen)
+{
+	const char *hex;
+	unsigned char *curbyt, nibh, nibl;
+
+	if (len & 1)
+		len -= 1;
+	curbyt = buf;
+	for (hex = hexstr; hex < hexstr + len && curbyt < buf + buflen; curbyt++) {
+		nibh = hexval(*hex++);
+		nibl = hexval(*hex++);
+		*curbyt = (nibh << 4) | nibl;
+	}
+	return curbyt - buf;
+}
+
 static void icdi_urb_done(struct urb *urb)
 {
 	struct icdi_device *icdi;
@@ -705,12 +754,11 @@ static ssize_t version_show(struct device *dev,
 	icdi->buflen = BUFSIZE;
 	idx = sizeof(command_prefix) - 1;
 	memcpy(icdi->buf, command_prefix, idx);
-	for (i = 0; i < sizeof(command) - 1; i++)
-		idx += sprintf(icdi->buf + idx, "%02x", command[i]);
-	icdi->buf[idx] = 0;
+	idx += byte2hexstr(command, sizeof(command)-1, icdi->buf+idx, icdi->buflen - idx);
 	for (i = 1; i < idx; i++)
 		sum += icdi->buf[i];
-	idx += sprintf(icdi->buf + idx, "#%02x", sum);
+	icdi->buf[idx++] = '#';
+	idx += byte2hexstr(&sum, 1, icdi->buf+idx, icdi->buflen - idx);
 
 	usb_fill_bulk_urb(icdi->urb, icdi->usbdev, icdi->pipe_out,
 			icdi->buf, idx, icdi_urb_done, icdi);
@@ -760,8 +808,7 @@ static ssize_t version_show(struct device *dev,
 		dev_err(&icdi->intf->dev, "No response from command: %s\n", command);
 		retv = 0;
 	} else {
-		retv = pos;
-		memcpy(buf, icdi->buf, pos);
+		retv = hexstr2byte(icdi->buf+2, pos - 5, buf, 4096);
 	}
 
 exit_20:
@@ -853,7 +900,7 @@ static int icdi_probe(struct usb_interface *intf,
 		pntadr = ep->desc.bEndpointAddress;
 		pntattr = ep->desc.bmAttributes;
 		maxpkt_len = le16_to_cpu(ep->desc.wMaxPacketSize);
-		if ((pntattr & USB_ENDPOINT_XFERTYPE_MASK) != 2)
+		if ((pntattr & USB_ENDPOINT_XFERTYPE_MASK) != USB_ENDPOINT_XFER_BULK)
 			continue;
 		if (pntadr & USB_DIR_IN)
 			icdi->pipe_in = usb_rcvbulkpipe(icdi->usbdev, pntadr);
