@@ -18,8 +18,7 @@
 #define ICDI_VID	0x1cbe
 #define ICDI_PID	0x00fd
 
-#define ICDI_START	"$"
-#define ICDI_END	"#"
+#define MAX_FMSIZE	(0x7ful << 56)
 
 struct icdi_device {
 	struct mutex lock;
@@ -28,78 +27,53 @@ struct icdi_device {
 	struct completion urbdone;
 	struct urb *urb;
 	unsigned char *buf;
-	int buflen;
-	int nxfer;
 	int intfnum;
-	int xfersize;
 	int pipe_in, pipe_out;
-	volatile int resp;
+	int buflen;
+	int inflen;
+	volatile int resp, nxfer;
 	union {
 		unsigned char attrs;
 		struct {
 			unsigned int firmware_attr:1;
 			unsigned int fmsize_attr:1;
 			unsigned int version_attr:1;
+			unsigned int indebug_attr:1;
 		};
 	};
+	unsigned int erase_size;
+	int partno;
 };
 
-/*static int icdi_send(struct icdi_device *icdi, int *xfer)
-{
-}
-#define USB_DFU_DETACH		0
-#define USB_DFU_DNLOAD		1
-#define USB_DFU_UPLOAD		2
-#define USB_DFU_GETSTATUS	3
-#define USB_DFU_CLRSTATUS	4
-#define USB_DFU_GETSTATE	5
-#define USB_DFU_ABORT		6
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Dashi Cao");
+MODULE_DESCRIPTION("TI USB ICDI Driver");
 
-#define USB_DFU_SUBCLASS	1
-#define USB_DFU_PROTO_RUNTIME	1
-#define USB_DFU_PROTO_DFUMODE	2
 
-#define USB_DFU_FUNC_DSCLEN	9
-#define USB_DFU_FUNC_DSCTYP	0x21
+static int urb_timeout = 200; /* milliseconds */
+module_param(urb_timeout, int, 0644);
+MODULE_PARM_DESC(urb_timeout, "USB urb completion timeout. "
+	"Default: 200 milliseconds.");
 
-#define USB_DFU_ERROR_CODE	255
+static const uint32_t FP_CTRL	= 0xe0002000;
+static const uint32_t DID0	= 0x400fe000;
+static const uint32_t DID1	= 0x400fe004;
+static const uint32_t DHCSR	= 0xe000edf0;
+static const uint32_t CPUID	= 0xe000ed00;
+static const uint32_t ICTR	= 0xE000E004;
+static const uint32_t FMA	= 0x400fd000;
 
-#define CAN_DOWNLOAD	1
-#define CAN_UPLOAD	2
-#define CAN_MANIFEST	4
-#define CAN_DETACH	8
-
-#define MAX_FMSIZE	(0x7ful << 56)
-
-struct dfufdsc {
-	__u8 len;
-	__u8 dsctyp;
-	__u8 attr;
-	__le16 tmout;
-	__le16 xfersize;
-	__le16 ver;
-} __packed;
-
-struct icdi_status {
-	__u8 bStatus;
-	__u8 wmsec[3];
-	__u8 bState;
-	__u8 istr;
-} __packed;
-
-enum icdi_state {
-	appIDLE = 0,
-	appDETACH = 1,
-	dfuIDLE = 2,
-	dfuDNLOAD_SYNC = 3,
-	dfuDNLOAD_BUSY = 4,
-	dfuDNLOAD_IDLE = 5,
-	dfuMANIFEST_SYNC = 6,
-	dfuMANIFEST = 7,
-	dfuMANIFEST_WAIT_RESET = 8,
-	dfuUPLOAD_IDLE = 9,
-	dfuERROR = 10
+static const struct usb_device_id icdi_ids[] = {
+	{	.match_flags = USB_DEVICE_ID_MATCH_DEVICE|
+			USB_DEVICE_ID_MATCH_INT_CLASS,
+		.idVendor = ICDI_VID,
+		.idProduct = ICDI_PID,
+		.bInterfaceClass = USB_CLASS_VENDOR_SPEC,
+	},
+	{}
 };
+
+MODULE_DEVICE_TABLE(usb, icdi_ids);
 
 static void icdi_urb_done(struct urb *urb)
 {
@@ -117,400 +91,14 @@ static void icdi_urb_timeout(struct icdi_device *icdi)
 	wait_for_completion(&icdi->urbdone);
 }
 
-int icdi_submit_urb(struct icdi_device *icdi, struct usb_ctrlrequest *req,
-	       	int tmout, void *datbuf, int buflen)
-{
-	int retusb, retv, pipe;
-	unsigned long jiff_wait;
-
-	pipe = -1;
-	if (req->bRequestType == USB_DFU_FUNC_DOWN)
-		pipe = usb_sndctrlpipe(icdi->usbdev, 0);
-	else if (req->bRequestType == USB_DFU_FUNC_UP)
-		pipe = usb_rcvctrlpipe(icdi->usbdev, 0);
-	usb_fill_control_urb(icdi->urb, icdi->usbdev, pipe,
-			(unsigned char *)req,
-			datbuf, buflen, icdi_urb_done, icdi);
-	init_completion(&icdi->urbdone);
-	icdi->resp = USB_DFU_ERROR_CODE;
-	icdi->nxfer = 0;
-	retusb = usb_submit_urb(icdi->urb, GFP_KERNEL);
-	if (retusb != 0) {
-		dev_err(&icdi->intf->dev,
-			"URB type: %2.2x, req: %2.2x submit failed: %d\n",
-			(int)req->bRequestType, (int)req->bRequest, retusb);
-		return retusb;
-	}
-
-	jiff_wait = msecs_to_jiffies(tmout);
-	if (!wait_for_completion_timeout(&icdi->urbdone, jiff_wait)) {
-		icdi_urb_timeout(icdi);
-		dev_err(&icdi->intf->dev,
-			"URB req type: %2.2x, req: %2.2x timeout\n",
-			(int)req->bRequestType, (int)req->bRequest);
-		return icdi->resp;
-	}
-	retv = READ_ONCE(icdi->resp);
-	if (retv)
-		dev_err(&icdi->intf->dev,
-			"URB type: %2.2x, req: %2.2x request failed: %d\n",
-			(int)req->bRequestType, (int)req->bRequest, retv);
-
-	return retv;
-}*/
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Dashi Cao");
-MODULE_DESCRIPTION("TI USB ICDI Driver");
-
-
-static int urb_timeout = 200; /* milliseconds */
-module_param(urb_timeout, int, 0644);
-MODULE_PARM_DESC(urb_timeout, "USB urb completion timeout. "
-	"Default: 200 milliseconds.");
-
-static const struct usb_device_id icdi_ids[] = {
-	{	.match_flags = USB_DEVICE_ID_MATCH_DEVICE|
-			USB_DEVICE_ID_MATCH_INT_CLASS,
-		.idVendor = ICDI_VID,
-		.idProduct = ICDI_PID,
-		.bInterfaceClass = USB_CLASS_VENDOR_SPEC,
-	},
-	{}
-};
-
-MODULE_DEVICE_TABLE(usb, icdi_ids);
-
-/*static inline int icdi_abort(struct icdi_device *icdi)
-{
-	icdi->auxreq.bRequestType = USB_DFU_FUNC_DOWN;
-	icdi->auxreq.bRequest = USB_DFU_ABORT;
-	icdi->auxreq.wIndex = cpu_to_le16(icdi->intfnum);
-	icdi->auxreq.wValue = 0;
-	icdi->auxreq.wLength = 0;
-	return icdi_submit_urb(icdi, &icdi->auxreq, urb_timeout, NULL, 0);
-}
-
-static inline int icdi_detach(struct icdi_device *icdi)
-{
-	icdi->auxreq.bRequestType = USB_DFU_FUNC_DOWN;
-	icdi->auxreq.bRequest = USB_DFU_DETACH;
-	icdi->auxreq.wIndex = cpu_to_le16(icdi->intfnum);
-	icdi->auxreq.wValue = icdi->dettmout > 5000? 5000 : icdi->dettmout;
-	icdi->auxreq.wLength = 0;
-	return icdi_submit_urb(icdi, &icdi->auxreq, urb_timeout, NULL, 0);
-}
-
-static inline int icdi_get_status(struct icdi_device *icdi)
-{
-	icdi->auxreq.bRequestType = USB_DFU_FUNC_UP;
-	icdi->auxreq.bRequest = USB_DFU_GETSTATUS;
-	icdi->auxreq.wIndex = cpu_to_le16(icdi->intfnum);
-	icdi->auxreq.wValue = 0;
-	icdi->auxreq.wLength = cpu_to_le16(6);
-	return icdi_submit_urb(icdi, &icdi->auxreq, urb_timeout,
-			&icdi->status, sizeof(icdi->status));
-}
-
-static inline int icdi_get_state(struct icdi_device *icdi)
-{
-	int retv;
-
-	icdi->auxreq.bRequestType = USB_DFU_FUNC_UP;
-	icdi->auxreq.bRequest = USB_DFU_GETSTATE;
-	icdi->auxreq.wIndex = cpu_to_le16(icdi->intfnum);
-	icdi->auxreq.wValue = 0;
-	icdi->auxreq.wLength = cpu_to_le16(1);
-	retv = icdi_submit_urb(icdi, &icdi->auxreq, urb_timeout,
-			&icdi->state, sizeof(icdi->state));
-	if (retv == 0)
-		retv = icdi->state;
-	return retv;
-}
-
-static inline int icdi_clear_status(struct icdi_device *icdi)
-{
-	icdi->auxreq.bRequestType = USB_DFU_FUNC_DOWN;
-	icdi->auxreq.bRequest = USB_DFU_CLRSTATUS;
-	icdi->auxreq.wIndex = cpu_to_le16(icdi->intfnum);
-	icdi->auxreq.wValue = 0;
-	icdi->auxreq.wLength = 0;
-	return icdi_submit_urb(icdi, &icdi->auxreq, urb_timeout, NULL, 0);
-}
-
-static inline int icdi_finish_dnload(struct icdi_device *icdi)
-{
-	icdi->prireq.bRequestType = USB_DFU_FUNC_DOWN;
-	icdi->prireq.bRequest = USB_DFU_DNLOAD;
-	icdi->prireq.wIndex = cpu_to_le16(icdi->intfnum);
-	icdi->prireq.wValue = 0;
-	icdi->prireq.wLength = 0;
-	return icdi_submit_urb(icdi, &icdi->prireq, urb_timeout, NULL, 0);
-}
-
-static inline int wmsec2int(unsigned char *wmsec)
-{
-	return (wmsec[2] << 16)|(wmsec[1] << 8) | wmsec[0];
-}
-
-static int icdi_wait_state(struct icdi_device *icdi, int state_mask)
-{
-	int count = 0, usb_resp, mwait;
-
-	state_mask |= (1<<dfuERROR);
-	do {
-		usb_resp = icdi_get_status(icdi);
-		if (usb_resp) {
-			dev_err(&icdi->intf->dev, "Cannot get DFU status: " \
-					"%d\n", usb_resp);
-			return usb_resp;
-		}
-		if (state_mask & (1 << icdi->status.bState))
-			break;
-		mwait = wmsec2int(icdi->status.wmsec);
-		msleep(mwait);
-		count += 1;
-	} while (count < 5);
-	if (count == 5)
-		dev_err(&icdi->intf->dev, "DFU Stalled\n");
-	return icdi->status.bState;
-}
-static ssize_t abort_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct icdi_device *icdi;
-	struct usb_interface *intf;
-	char *strbuf;
-
-	if (count != 3 || memcmp(buf, "xxx", 3) != 0) {
-		strbuf = kmalloc(count+1, GFP_KERNEL);
-		if (!strbuf) {
-			dev_err(dev, "Out of Memory\n");
-			return count;
-		}
-		memcpy(strbuf, buf, count);
-		strbuf[count] = 0;
-		dev_err(dev, "Invalid Detach Token: %s\n", strbuf);
-		kfree(strbuf);
-		return count;
-	}
-
-	intf = container_of(dev, struct usb_interface, dev);
-	icdi = usb_get_intfdata(intf);
-	icdi_abort(icdi);
-	return count;
-}
-
-static ssize_t detach_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct icdi_device *icdi;
-	struct usb_interface *interface;
-	int resp;
-	char *strbuf;
-
-	
-	if (count != 3 || memcmp(buf, "---", 3) != 0) {
-		strbuf = kmalloc(count+1, GFP_KERNEL);
-		if (!strbuf) {
-			dev_err(dev, "Out of Memory\n");
-			return count;
-		}
-		memcpy(strbuf, buf, count);
-		strbuf[count] = 0;
-		dev_err(dev, "Invalid Detach Token: %s\n", strbuf);
-		kfree(strbuf);
-		return count;
-	}
-
-	interface = container_of(dev, struct usb_interface, dev);
-	icdi = usb_get_intfdata(interface);
-	mutex_lock(&icdi->lock);
-	resp = icdi_detach(icdi);
-	if (resp && resp != -EPROTO) {
-		dev_err(dev, "Cannot detach the DFU device: %d\n", resp);
-		goto exit_10;
-	}
-	if ((icdi->cap & CAN_DETACH) == 0) {
-		resp = icdi_get_state(icdi);
-		if (resp != appDETACH) {
-			dev_err(dev, "DFU device is not in appDETACH state: %d\n",
-					resp);
-			goto exit_10;
-		}
-		usb_reset_device(icdi->usbdev);
-	}
-exit_10:
-	mutex_unlock(&icdi->lock);
-	return count;
-}
-
-static ssize_t capbility_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct icdi_device *icdi;
-	struct usb_interface *interface;
-	int cap, download, upload, manifest, detach;
-
-	interface = container_of(dev, struct usb_interface, dev);
-	icdi = usb_get_intfdata(interface);
-	cap = icdi->cap;
-	download = cap & 1;
-	cap = cap >> 1;
-	upload = cap & 1;
-	cap = cap >> 1;
-	manifest = cap & 1;
-	cap = cap >> 1;
-	detach = cap & 1;
-	return sprintf(buf, "Download:%d Upload:%d Manifest:%d Detach:%d\n",
-			download, upload, manifest, detach);
-}
-
-static ssize_t status_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct icdi_device *icdi;
-	struct usb_interface *interface;
-	int resp, mwait, retv;
-
-	interface = container_of(dev, struct usb_interface, dev);
-	icdi = usb_get_intfdata(interface);
-	mutex_lock(&icdi->lock);
-	resp = icdi_get_status(icdi);
-	mutex_unlock(&icdi->lock);
-	if (resp == 0) {
-		mwait = icdi->status.wmsec[2]<<16|
-			icdi->status.wmsec[1]<<8|
-			icdi->status.wmsec[0];
-		retv = sprintf(buf, "Status: %hhd State: %hhd Wait: %d\n",
-				icdi->status.bStatus,
-				icdi->status.bState,
-				mwait);
-	} else {
-		dev_err(dev, "Get DFU Status failed: %d\n", resp);
-		retv = 0;
-	}
-	return retv;
-}
-
 ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		struct bin_attribute *binattr,
-		char *buf, loff_t offset, size_t bufsz);
+		char *buf, loff_t offset, size_t bufsize);
 ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 		struct bin_attribute *binattr,
 		char *buf, loff_t offset, size_t bufsize);
 
-static DEVICE_ATTR_WO(detach);
-static DEVICE_ATTR_WO(abort);
-static DEVICE_ATTR_RO(version);
-static DEVICE_ATTR_RO(status);
 static BIN_ATTR_RW(firmware, 0);
-
-ssize_t firmware_read(struct file *filep, struct kobject *kobj,
-		struct bin_attribute *binattr, 
-		char *buf, loff_t offset, size_t bufsz)
-{
-	struct device *dev;
-	struct usb_interface *intf;
-	struct icdi_device *icdi;
-	int pos, usb_resp, remlen, icdi_state, blknum, state_mask;
-	unsigned long fm_size;
-	char *curbuf;
-
-	if (unlikely(bufsz == 0))
-		return bufsz;
-	fm_size = binattr->size;
-	if (fm_size == 0)
-		fm_size = MAX_FMSIZE;
-
-	dev = container_of(kobj, struct device, kobj);
-	intf = container_of(dev, struct usb_interface, dev);
-	icdi = usb_get_intfdata(intf);
-	if ((icdi->cap & CAN_UPLOAD) == 0) {
-		dev_warn(dev, "has no upload capbility\n");
-		return 0;
-	}
-	if ((bufsz % icdi->xfersize) != 0) {
-		dev_err(&icdi->intf->dev, "Buffer size: %lu is not a " \
-				"mutiple of DFU transfer size: %d\n",
-				bufsz, icdi->xfersize);
-		return -EINVAL;
-	}
-	pos = 0;
-	curbuf = buf;
-	remlen = offset + bufsz <= fm_size? bufsz : fm_size - offset;
-	icdi->prireq.bRequestType = USB_DFU_FUNC_UP;
-	icdi->prireq.bRequest = USB_DFU_UPLOAD;
-	icdi->prireq.wIndex = cpu_to_le16(icdi->intfnum);
-	icdi->prireq.wLength = cpu_to_le16(icdi->xfersize);
-	blknum = offset / icdi->xfersize;
-
-	mutex_lock(&icdi->lock);
-	icdi_state = icdi_get_state(icdi);
-	if (offset > 0 && icdi_state == dfuIDLE)
-		goto exit_10;
-	if ((offset == 0 && icdi_state != dfuIDLE) ||
-			(offset > 0 && icdi_state != dfuUPLOAD_IDLE)) {
-		dev_err(&icdi->intf->dev, "Incompatible State for " \
-				"uploading: %d, Offset: %lld\n",
-				icdi_state, offset);
-		pos = -EPROTO;
-		goto exit_10;
-	}
-	icdi_state = dfuUPLOAD_IDLE;
-	state_mask = (1<<dfuUPLOAD_IDLE|1<<dfuIDLE);
-	while (remlen > icdi->xfersize && offset + pos < fm_size &&
-			icdi_state == dfuUPLOAD_IDLE) {
-		icdi->prireq.wValue = cpu_to_le16(blknum);
-		usb_resp = icdi_submit_urb(icdi, &icdi->prireq, urb_timeout,
-				curbuf, icdi->xfersize);
-		if (usb_resp) {
-			dev_err(dev, "DFU upload error: %d\n", usb_resp);
-			pos = usb_resp;
-			goto exit_10;
-		}
-		WARN_ON(icdi->nxfer == 0);
-		pos += icdi->nxfer;
-		curbuf += icdi->nxfer;
-		remlen -= icdi->nxfer;
-		blknum += 1;
-		icdi_state = icdi_wait_state(icdi, state_mask);
-	}
-	if (icdi_state == dfuIDLE) {
-		bin_attr_firmware.size = offset + pos;
-		goto exit_10;
-	}
-	if (unlikely(icdi_state != dfuUPLOAD_IDLE)) {
-		dev_err(&icdi->intf->dev, "Cannot continue uploading, " \
-				"inconsistent state: %d\n", icdi_state);
-		goto exit_10;
-	}
-	if (offset + pos == fm_size) {
-		icdi_abort(icdi);
-		goto exit_10;
-	}
-	BUG_ON(remlen == 0);
-	icdi->prireq.wValue = cpu_to_le16(blknum);
-	icdi->prireq.wLength = cpu_to_le16(remlen);
-	usb_resp = icdi_submit_urb(icdi, &icdi->prireq, urb_timeout,
-			curbuf, remlen);
-	if (usb_resp) {
-		dev_err(dev, "DFU upload error: %d\n", usb_resp);
-		pos = usb_resp;
-		goto exit_10;
-	}
-	WARN_ON(icdi->nxfer == 0);
-	pos += icdi->nxfer;
-	icdi_state = icdi_wait_state(icdi, state_mask);
-	if (offset + pos == fm_size && icdi_state == dfuUPLOAD_IDLE)
-			icdi_abort(icdi);
-	if (icdi_state == dfuIDLE)
-		bin_attr_firmware.size = offset + pos;
-
-exit_10:
-	mutex_unlock(&icdi->lock);
-	return pos;
-}
 
 ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 		struct bin_attribute *binattr,
@@ -519,9 +107,7 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 	struct device *dev;
 	struct usb_interface *intf;
 	struct icdi_device *icdi;
-	int icdi_state, pos, usb_resp, remlen, blknum, state_mask;
 	unsigned long fm_size;
-	char *curbuf;
 
 	if (unlikely(bufsize == 0))
 		return 0;
@@ -535,112 +121,13 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 
 	intf = container_of(dev, struct usb_interface, dev);
 	icdi = usb_get_intfdata(intf);
-	if ((icdi->cap & CAN_DOWNLOAD) == 0) {
-		dev_err(dev, "DFU Device has no download capbility\n");
-		return -EINVAL;
-	}
-	if (offset == fm_size && bufsize > 0) {
-		dev_err(dev, "Cannot program past the end of image. " \
-				"Current offset: %lld\n", offset);
-		return -EINVAL;
-	}
-	pos = 0;
-	remlen = offset + bufsize <= fm_size? bufsize : fm_size - offset;
-	curbuf = buf;
-	icdi->prireq.bRequestType = USB_DFU_FUNC_DOWN;
-	icdi->prireq.bRequest = USB_DFU_DNLOAD;
-	icdi->prireq.wIndex = cpu_to_le16(icdi->intfnum);
-	icdi->prireq.wLength = cpu_to_le16(icdi->xfersize);
-	blknum = offset / icdi->xfersize;
-	mutex_lock(&icdi->lock);
-	icdi_state = icdi_get_state(icdi);
-	if ((offset == 0 && icdi_state != dfuIDLE) ||
-			(offset > 0 && icdi_state != dfuDNLOAD_IDLE)) {
-		dev_err(dev, "Inconsistent DFU State, offset: %lld " \
-				"State: %d\n", offset, icdi_state);
-		pos = -EPROTO;
-		goto exit_10;
-	}
-	icdi_state = dfuDNLOAD_IDLE;
-	state_mask = (1 << dfuDNLOAD_IDLE);
-	while (remlen > icdi->xfersize && offset + pos < fm_size &&
-			icdi_state == dfuDNLOAD_IDLE) {
-		icdi->prireq.wValue = cpu_to_le16(blknum);
-		usb_resp = icdi_submit_urb(icdi, &icdi->prireq, urb_timeout,
-				curbuf, icdi->xfersize);
-		if (usb_resp) {
-			dev_err(dev, "DFU download error: %d\n", usb_resp);
-			pos = usb_resp;
-			goto exit_10;
-		}
-		WARN_ON(icdi->nxfer == 0);
-		pos += icdi->nxfer;
-		curbuf += icdi->nxfer;
-		remlen -= icdi->nxfer;
-		blknum += 1;
-		icdi_state = icdi_wait_state(icdi, state_mask);
-	}
-	if (unlikely(icdi_state != dfuDNLOAD_IDLE)) {
-		dev_err(&icdi->intf->dev, "Cannot continue downloading. " \
-				"Invalid state: %d\n", icdi_state);
-		goto exit_10;
-	}
-	if (offset + pos < fm_size) {
-		BUG_ON(remlen == 0);
-		icdi->prireq.wValue = cpu_to_le16(blknum);
-		icdi->prireq.wLength = cpu_to_le16(remlen);
-		usb_resp = icdi_submit_urb(icdi, &icdi->prireq, urb_timeout,
-				curbuf, remlen);
-		if (usb_resp) {
-			dev_err(dev, "DFU download error: %d\n", usb_resp);
-			pos = usb_resp;
-			goto exit_10;
-		}
-		WARN_ON(icdi->nxfer == 0);
-		pos += icdi->nxfer;
-		icdi_state = icdi_wait_state(icdi, state_mask);
-	}
-	if (offset + pos == fm_size) {
-		icdi->prireq.wValue = cpu_to_le16(blknum+1);
-		icdi->prireq.wLength = 0;
-		usb_resp = icdi_submit_urb(icdi, &icdi->prireq, urb_timeout,
-				NULL, 0);
-		if (usb_resp) {
-			dev_err(dev, "DFU download error: %d\n", usb_resp);
-			pos = usb_resp;
-			goto exit_10;
-		}
-		state_mask = (1<<dfuIDLE)|(1<<dfuMANIFEST)|
-			(1<<dfuMANIFEST_WAIT_RESET);
-		icdi_state = icdi_wait_state(icdi, state_mask);
-		if (icdi_state == dfuIDLE)
-			goto exit_10;
-		msleep(wmsec2int(icdi->status.wmsec)+1);
-		icdi_state = icdi_wait_state(icdi, state_mask);
-		if (icdi_state == dfuIDLE)
-			goto exit_10;
-		if (icdi_state == dfuMANIFEST_WAIT_RESET) {
-			usb_reset_device(icdi->usbdev);
-			goto exit_10;
-		}
-		if (icdi_state == dfuERROR) {
-			icdi_clear_status(icdi);
-			dev_warn(&icdi->intf->dev, "State changed to " \
-					"dfuERROR. Error cleared\n");
-		} else
-			dev_warn(&icdi->intf->dev, "Unexpected State after" \
-				       " firmware downloading\n");
-	}
-
-exit_10:
-	mutex_unlock(&icdi->lock);
-	return pos;
+	return 0;
 }
 
 static ssize_t fmsize_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%lu", bin_attr_firmware.size);
+	return sprintf(buf, "%lu\n", bin_attr_firmware.size);
 }
 
 static ssize_t fmsize_store(struct device *dev,
@@ -660,10 +147,7 @@ static ssize_t fmsize_store(struct device *dev,
 	return buflen;
 }
 
-static DEVICE_ATTR_RW(fmsize); */
-#define FLASH_BLOCK_SIZE 512
-#define FLASH_ERASE_SIZE 1024
-#define BUFSIZE (64 + 2*FLASH_BLOCK_SIZE)
+static DEVICE_ATTR_RW(fmsize);
 
 static inline int byte2hexstr(const unsigned char *bytes, int len,
 		char *buf, int buflen)
@@ -684,17 +168,22 @@ static inline int byte2hexstr(const unsigned char *bytes, int len,
 	return curchr - buf;
 }
 
-static inline unsigned char hexval(char hdigit)
+static inline unsigned char val2hex(unsigned char val)
+{
+	unsigned char nib = val & 0x0f;
+	return nib > 9? 'a' + nib - 10 : '0' + nib;
+}
+
+static inline unsigned char hex2val(char hex)
 {
 	unsigned char v = 0;
 
-	v = 16;
-	if (hdigit >= 'a' && hdigit <= 'f')
-		v = hdigit - 'a' + 10;
-	else if (hdigit >= 'A' && hdigit <= 'F')
-		v = hdigit - 'A' + 10;
-	else if (hdigit >= '0' && hdigit <= '9')
-		v = hdigit - '0';
+	if (hex >= 'a' && hex <= 'f')
+		v = hex - 'a' + 10;
+	else if (hex >= 'A' && hex <= 'F')
+		v = hex - 'A' + 10;
+	else if (hex >= '0' && hex <= '9')
+		v = hex - '0';
 	return v;
 }
 
@@ -707,79 +196,75 @@ static inline int hexstr2byte(const char *hexstr, int len, unsigned char *buf, i
 		len -= 1;
 	curbyt = buf;
 	for (hex = hexstr; hex < hexstr + len && curbyt < buf + buflen; curbyt++) {
-		nibh = hexval(*hex++);
-		nibl = hexval(*hex++);
+		nibh = hex2val(*hex++);
+		nibl = hex2val(*hex++);
 		*curbyt = (nibh << 4) | nibl;
 	}
 	return curbyt - buf;
 }
 
-static void icdi_urb_done(struct urb *urb)
+static inline int append_check_sum(unsigned char *buf, int len, int buflen)
 {
-	struct icdi_device *icdi;
+	unsigned char sum = 0;
+	int i, pos;
 
-	icdi = urb->context;
-	icdi->resp = urb->status;
-	icdi->nxfer = urb->actual_length;
-	complete(&icdi->urbdone);
+	for (i = 1; i < len; i++)
+		sum += buf[i];
+	pos = len;
+	buf[pos++] = '#';
+	pos += byte2hexstr(&sum, 1, buf+pos, buflen - pos);
+	return pos;
 }
 
-static void icdi_urb_timeout(struct icdi_device *icdi)
+static void dump_response(struct icdi_device *icdi, int reslen)
 {
-	usb_unlink_urb(icdi->urb);
-	wait_for_completion(&icdi->urbdone);
-}
+	unsigned char *buf;
+	int len;
 
-static const char command_prefix[] = "$qRcmd,";
+	if (reslen <= 0)
+		return;
 
-static ssize_t version_show(struct device *dev,
-                struct device_attribute *attr, char *buf)
-{
-	struct icdi_device *icdi;
-	struct usb_interface *interface;
-	int idx, i, retv, pos;
-	uint8_t sum = 0;
-	unsigned long jiff_wait;
-	static const char command[] = "version";
-
-	retv = 0;
-	interface = container_of(dev, struct usb_interface, dev);
-	icdi = usb_get_intfdata(interface);
-	mutex_lock(&icdi->lock);
-	icdi->buf = kmalloc(BUFSIZE, GFP_KERNEL);
-	if (!icdi->buf) {
-		retv = -ENOMEM;
-		goto exit_10;
+	dev_info(&icdi->intf->dev, "Response length %d: %s\n", reslen, icdi->buf);
+	buf = kmalloc(2*reslen+1, GFP_KERNEL);
+	if (!buf) {
+		dev_warn(&icdi->intf->dev, "Out of Memory when dumping response");
+		return;
 	}
-	icdi->buflen = BUFSIZE;
-	idx = sizeof(command_prefix) - 1;
-	memcpy(icdi->buf, command_prefix, idx);
-	idx += byte2hexstr(command, sizeof(command)-1, icdi->buf+idx, icdi->buflen - idx);
-	for (i = 1; i < idx; i++)
-		sum += icdi->buf[i];
-	icdi->buf[idx++] = '#';
-	idx += byte2hexstr(&sum, 1, icdi->buf+idx, icdi->buflen - idx);
+	len = byte2hexstr(icdi->buf, reslen, buf, 2*reslen);
+	buf[len] = 0;
+	dev_info(&icdi->intf->dev, "Raw Response: %s\n", buf);
+	kfree(buf);
+}
 
+static int usb_sndrcv(struct icdi_device *icdi)
+{
+	int retv, pos, len;
+	unsigned long jiff_wait;
+	char command[32];
+	unsigned char *curchr, sum = 0;
+
+	pos = sizeof(command) - 1;
+	len = icdi->inflen > pos? pos : icdi->inflen;
+	memcpy(command, icdi->buf, len);
+	command[len] = 0;
 	usb_fill_bulk_urb(icdi->urb, icdi->usbdev, icdi->pipe_out,
-			icdi->buf, idx, icdi_urb_done, icdi);
+			icdi->buf, icdi->inflen, icdi_urb_done, icdi);
 	init_completion(&icdi->urbdone);
 	icdi->resp = -255;
 	icdi->nxfer = 0;
 	retv = usb_submit_urb(icdi->urb, GFP_KERNEL);
-	if (retv != 0) {
-		dev_err(&icdi->intf->dev, "URB bulk write submit failed: %d\n", retv);
-		goto exit_20;
+	if (unlikely(retv != 0)) {
+		dev_err(&icdi->intf->dev, "URB bulk write submit failed: %d, command: %s\n", retv, command);
+		return retv;
 	}
 	jiff_wait = msecs_to_jiffies(urb_timeout);
 	if (!wait_for_completion_timeout(&icdi->urbdone, jiff_wait)) {
 		icdi_urb_timeout(icdi);
-		dev_warn(&icdi->intf->dev, "URB bulk write operation timeout\n");
-		retv = 0;
-		goto exit_20;
+		dev_warn(&icdi->intf->dev, "URB bulk write operation timeout, command: %s\n", command);
 	}
 	retv = icdi->resp;
 	if (unlikely(retv != 0))
-		goto exit_20;
+		return retv;
 
 	pos = 0;
 	icdi->buf[0] = '+';
@@ -791,30 +276,329 @@ static ssize_t version_show(struct device *dev,
 		icdi->resp = -255;
 		icdi->nxfer = 0;
 		retv = usb_submit_urb(icdi->urb, GFP_KERNEL);
-		if (retv != 0) {
-			dev_err(&icdi->intf->dev, "URB bulk read submit failed: %d\n", retv);
-			goto exit_20;
+		if (unlikely(retv != 0)) {
+			dev_err(&icdi->intf->dev, "URB bulk read submit failed: %d, command: %s\n", retv, command);
+			return retv;
 		}
 		jiff_wait = msecs_to_jiffies(urb_timeout);
 		if (!wait_for_completion_timeout(&icdi->urbdone, jiff_wait)) {
 			icdi_urb_timeout(icdi);
-			dev_warn(&icdi->intf->dev, "URB bulk read operation timeout\n");
-			retv = 0;
-			goto exit_20;
+			dev_warn(&icdi->intf->dev, "URB bulk read operation timeout, command %s\n", command);
+		}
+		retv = icdi->resp;
+		if (unlikely(retv != 0)) {
+			dev_err(&icdi->intf->dev, "URB bulk read failed: %d, command: %s\n", retv, command);
+			return retv;
 		}
 		pos += icdi->nxfer;
-	} while ((pos < 5 || icdi->buf[pos-3] != '#') && icdi->buf[0] == '+');
-	if (icdi->buf[0] != '+') {
-		dev_err(&icdi->intf->dev, "No response from command: %s\n", command);
-		retv = 0;
-	} else {
-		retv = hexstr2byte(icdi->buf+2, pos - 5, buf, 4096);
+	} while ((pos < 3 || icdi->buf[pos-3] != '#') && icdi->buf[0] == '+');
+	icdi->buf[pos] = 0;
+	if (memcmp(icdi->buf, "+$OK:", 5) == 0)
+		len = 5;
+	else
+		len = 2;
+	for (curchr = icdi->buf+len; *curchr != '#' && curchr < icdi->buf + pos; curchr++)
+		sum+= *curchr;
+	retv = (hex2val(icdi->buf[pos-2]) << 4) | hex2val(icdi->buf[pos-1]);
+	if ((sum - retv) != 0)
+		dev_info(&icdi->intf->dev, "Raw response checksum error. check sum: %02hhx, retv: %x\n", sum, retv);
+	if (icdi->buf[0] != '+')
+		dev_err(&icdi->intf->dev, "No valid response from command: %s\n", command);
+
+	return pos;
+}
+
+static const char qRcmd[] = "$qRcmd,";
+static const char qSupported[] = "$qSupported";
+static const char qmark[] = "$?";
+
+static int qRcmd_setup(unsigned char *buf, int buflen, const char *arg, int arglen)
+{
+	int len;
+
+	len = sizeof(qRcmd) - 1;
+	memcpy(buf, qRcmd, len);
+	len += byte2hexstr(arg, arglen, buf+len, buflen - len);
+	len = append_check_sum(buf, len, buflen);
+	return len;
+}
+
+static inline void uint2hexstr(unsigned int val, char *hexs)
+{
+	unsigned char bytes[4];
+
+	bytes[0] = (val >> 24) & 0x0ff;
+	bytes[1] = (val >> 16) & 0x0ff;
+	bytes[2] = (val >> 8) & 0x0ff;
+	bytes[3] = val & 0x0ff;
+	hexs[0] = val2hex(bytes[0]>>4);
+	hexs[1] = val2hex(bytes[0] & 0x0f);
+	hexs[2] = val2hex(bytes[1]>>4);
+	hexs[3] = val2hex(bytes[1] & 0x0f);
+	hexs[4] = val2hex(bytes[2]>>4);
+	hexs[5] = val2hex(bytes[2] & 0x0f);
+	hexs[6] = val2hex(bytes[3]>>4);
+	hexs[7] = val2hex(bytes[3] & 0x0f);
+}
+
+static unsigned int mem_read(struct icdi_device *icdi, unsigned int addr)
+{
+	static const char memr[] = "$x,4";
+	int len;
+       	unsigned int val;
+
+	val = 0xffffffff;
+	memcpy(icdi->buf, memr, 2);
+	uint2hexstr(addr, icdi->buf+2);
+	memcpy(icdi->buf+10, memr+2, 2);
+	icdi->inflen = append_check_sum(icdi->buf, 12, icdi->buflen);
+	icdi->buf[icdi->inflen] = 0;
+	len = usb_sndrcv(icdi);
+	if (len == 12)
+		val = icdi->buf[5]|(icdi->buf[6]<<8)|(icdi->buf[7]<<16)|
+			(icdi->buf[8]<<24);
+	return val;
+}
+
+static void mem_write(struct icdi_device *icdi, unsigned int addr, unsigned int val)
+{
+	int len;
+	static const char memw[] = "$X,4:";
+
+	memcpy(icdi->buf, memw, 2);
+	uint2hexstr(addr, icdi->buf+2);
+	memcpy(icdi->buf+10, memw+2, 3);
+	uint2hexstr(val, icdi->buf+13);
+	icdi->inflen = append_check_sum(icdi->buf, 21, icdi->buflen);
+	len = usb_sndrcv(icdi);
+	if (len > 0)
+		dump_response(icdi, len);
+}
+
+static int stop_debug(struct icdi_device *icdi)
+{
+	int len;
+	static const char debug_hreset[] = "debug hreset";
+	static const char restore_vector[] = "set vectorcatch 0";
+	static const char debug_disable[] = "debug disable";
+
+	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, restore_vector, sizeof(restore_vector) - 1);
+	len = usb_sndrcv(icdi);
+	if (unlikely(len <= 0)) {
+		dump_response(icdi, len);
+		return len;
 	}
+
+	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, debug_hreset, sizeof(debug_hreset) - 1);
+	len = usb_sndrcv(icdi);
+	if (unlikely(len <= 0)) {
+		dump_response(icdi, len);
+		return len;
+	}
+
+	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, debug_disable, sizeof(debug_disable) - 1);
+	len = usb_sndrcv(icdi);
+	if (unlikely(len <= 0)) {
+		dump_response(icdi, len);
+		return len;
+	}
+	icdi->indebug_attr = 0;
+	return len;
+}
+
+static int start_debug(struct icdi_device *icdi)
+{
+	int len, retv;
+	unsigned int val;
+	static const char debug_clock[] = "debug clock \0";
+	static const char debug_sreset[] = "debug sreset";
+
+	retv = -1;
+	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, debug_clock, sizeof(debug_clock) - 1);
+	len = usb_sndrcv(icdi);
+	if (unlikely(len <= 0))
+		return retv;
+	len = sizeof(qSupported) - 1;
+	memcpy(icdi->buf, qSupported, len);
+	icdi->inflen = append_check_sum(icdi->buf, len, icdi->buflen);
+	len = usb_sndrcv(icdi);
+	if (unlikely(len <= 0))
+		return retv;
+	len = sizeof(qmark) - 1;
+	memcpy(icdi->buf, qmark, len);
+	icdi->inflen = append_check_sum(icdi->buf, len, icdi->buflen);
+	len = usb_sndrcv(icdi);
+	if (unlikely(len <= 0))
+		return retv;
+	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, debug_sreset, sizeof(debug_sreset) - 1);
+	len = usb_sndrcv(icdi);
+	if (unlikely(len <= 0))
+		return retv;
+	val = mem_read(icdi, DHCSR);
+	if (val != 0x00030003)
+		dev_warn(&icdi->intf->dev, "Maybe not in debug state\n");
+	icdi->indebug_attr = 1;
+	return 0;
+}
+
+static int get_erase_size(struct icdi_device *icdi)
+{
+	int retv;
+	unsigned int val;
+
+	icdi->buflen = 1024;
+	icdi->buf = kmalloc(1024, GFP_KERNEL);
+	if (unlikely(!icdi->buf)) {
+		icdi->erase_size = 1024;
+		dev_warn(&icdi->intf->dev, "Out of Memory. Erase Block Size set to %d\n", icdi->erase_size);
+		icdi->buflen = 0;
+		return -ENOMEM;
+	}
+
+	retv = start_debug(icdi);
+	if (unlikely(retv != 0)) {
+		icdi->erase_size = 4096;
+		dev_warn(&icdi->intf->dev, "Cannot enter into debug state: %d\n", retv);
+		goto exit_10;
+	}
+	val = mem_read(icdi, DID1);
+	icdi->partno = (val >> 16) & 0x0ff;
+	switch(icdi->partno) {
+	case 0x2d:
+		icdi->erase_size = 16384;
+		bin_attr_firmware.size = 1048576;
+		break;
+	case 0xa1:
+		icdi->erase_size = 1024;
+		bin_attr_firmware.size = 256000;
+		break;
+	default:
+		icdi->erase_size = 4096;
+	}
+	stop_debug(icdi);
+
+exit_10:
+	kfree(icdi->buf);
+	icdi->buf = NULL;
+	icdi->buflen = 0;
+	return icdi->erase_size;
+}
+
+ssize_t firmware_read(struct file *filep, struct kobject *kobj,
+		struct bin_attribute *binattr, 
+		char *buf, loff_t offset, size_t bufsize)
+{
+	struct device *dev;
+	struct usb_interface *intf;
+	struct icdi_device *icdi;
+	int retv, len, xferlen, rdlen;
+	unsigned long fm_size;
+	unsigned int addr;
+	unsigned char *curbuf, *dst, *src, c;
+
+	if (unlikely(bufsize == 0))
+		return bufsize;
+	if (unlikely(bufsize % 128) != 0) {
+		dev_err(&icdi->intf->dev, "Read Buffer Size %lu is not a multiple of 128\n", bufsize);
+		return -EINVAL;
+	}
+	fm_size = binattr->size;
+	if (fm_size == 0)
+		fm_size = MAX_FMSIZE;
+
+	dev = container_of(kobj, struct device, kobj);
+	intf = container_of(dev, struct usb_interface, dev);
+	icdi = usb_get_intfdata(intf);
+	retv = 0;
+	mutex_lock(&icdi->lock);
+	icdi->buflen = 64 + 2 * icdi->erase_size;
+	icdi->buf = kmalloc(icdi->buflen, GFP_KERNEL);
+	if (unlikely(!icdi->buf)) {
+		dev_err(&icdi->intf->dev, "Out of Memory\n");
+		retv = -ENOMEM;
+		goto exit_10;
+	}
+	if (offset == 0)
+		start_debug(icdi);
+	if (offset > 4096) {
+		stop_debug(icdi);
+		retv = 0;
+		goto exit_20;
+	}
+	addr = offset;
+	curbuf = icdi->buf;
+	*curbuf++ = '$';
+	*curbuf++ = 'x';
+	uint2hexstr(addr, curbuf);
+	curbuf += 8;
+	*curbuf++ = ',';
+	rdlen = bufsize > icdi->erase_size? icdi->erase_size : bufsize;
+	uint2hexstr(rdlen, curbuf);
+	icdi->inflen = append_check_sum(icdi->buf, 19, icdi->buflen - 19);
+	len = usb_sndrcv(icdi);
+	if (unlikely(len < 0)) {
+		dev_err(&icdi->intf->dev, "Flash Dump failed: %08x, length: %lu\n", addr, bufsize);
+		goto exit_20;
+	}
+	if (memcmp(icdi->buf, "+$OK:", 5) != 0) {
+		dump_response(icdi, 32);
+		dev_err(&icdi->intf->dev, "Flash Read Failed\n");
+		goto exit_20;
+	}
+	dst = buf;
+	src = icdi->buf+5;
+	xferlen = 0;
+	while (src - icdi->buf < len - 3) {
+		c = *src++;
+		if (c == '}')
+			c = (*src++) ^ 0x20;
+		*dst++ = c;
+		xferlen += 1;
+	}
+	WARN_ON(xferlen != rdlen);
+	retv = xferlen;
 
 exit_20:
 	kfree(icdi->buf);
 	icdi->buf = NULL;
 exit_10:
+	icdi->buflen = 0;
+	mutex_unlock(&icdi->lock);
+	return retv;
+}
+
+static ssize_t version_show(struct device *dev,
+                struct device_attribute *attr, char *buf)
+{
+	struct icdi_device *icdi;
+	struct usb_interface *interface;
+	int len, retv;
+	static const char version[] = "version";
+
+	retv = 0;
+	interface = container_of(dev, struct usb_interface, dev);
+	icdi = usb_get_intfdata(interface);
+	mutex_lock(&icdi->lock);
+	icdi->buflen = icdi->erase_size*2 + 64;
+	icdi->buf = kmalloc(icdi->buflen, GFP_KERNEL);
+	if (!icdi->buf) {
+		retv = -ENOMEM;
+		goto exit_10;
+	}
+
+	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, version, sizeof(version) - 1);
+	len = usb_sndrcv(icdi);
+	if (len > 5)
+		retv = hexstr2byte(icdi->buf+2, len - 5, buf, 4096);
+	else {
+		memcpy(buf, icdi->buf, len);
+		retv = len;
+	}
+	kfree(icdi->buf);
+	icdi->buf = NULL;
+
+exit_10:
+	icdi->buflen = 0;
 	mutex_unlock(&icdi->lock);
 	return retv;
 }
@@ -832,26 +616,26 @@ static int icdi_create_attrs(struct icdi_device *icdi)
 				"Cannot create sysfs file 'version': %d\n", retv);
 	else
 		icdi->version_attr = 1;
-/*		retv = device_create_file(&icdi->intf->dev, &dev_attr_fmsize);
+	retv = device_create_file(&icdi->intf->dev, &dev_attr_fmsize);
+	if (unlikely(retv != 0))
+		dev_warn(&icdi->intf->dev,
+				"Cannot create sysfs file 'fmsize' %d\n", retv);
+	else
+		icdi->fmsize_attr = 1;
+/*		retv = device_create_file(&icdi->intf->dev, &dev_attr_abort);
 		if (unlikely(retv != 0))
 			dev_warn(&icdi->intf->dev,
 					"Cannot create sysfs file %d\n", retv);
 		else
-			icdi->fmsize_attr = 1;
-		retv = device_create_file(&icdi->intf->dev, &dev_attr_abort);
-		if (unlikely(retv != 0))
-			dev_warn(&icdi->intf->dev,
-					"Cannot create sysfs file %d\n", retv);
-		else
-			icdi->abort_attr = 1;
-		retv = sysfs_create_bin_file(&icdi->intf->dev.kobj,
-				&bin_attr_firmware);
-		if (unlikely(retv != 0))
-			dev_warn(&icdi->intf->dev,
-					"Cannot create sysfs file %d\n", retv);
-		else
-			icdi->firmware_attr = 1;
-	}
+			icdi->abort_attr = 1; */
+	retv = sysfs_create_bin_file(&icdi->intf->dev.kobj,
+			&bin_attr_firmware);
+	if (unlikely(retv != 0))
+		dev_warn(&icdi->intf->dev,
+				"Cannot create sysfs file %d\n", retv);
+	else
+		icdi->firmware_attr = 1;
+/*	}
 	retv = device_create_file(&icdi->intf->dev, &dev_attr_capbility);
 	if (unlikely(retv != 0))
 		dev_warn(&icdi->intf->dev, "Cannot create sysfs file %d\n",
@@ -865,12 +649,12 @@ static void icdi_remove_attrs(struct icdi_device *icdi)
 {
 	if (icdi->version_attr)
 		device_remove_file(&icdi->intf->dev, &dev_attr_version);
-/*	if (icdi->firmware_attr)
-		sysfs_remove_bin_file(&icdi->intf->dev.kobj, &bin_attr_firmware);
-	if (icdi->abort_attr)
-		device_remove_file(&icdi->intf->dev, &dev_attr_abort);
 	if (icdi->fmsize_attr)
 		device_remove_file(&icdi->intf->dev, &dev_attr_fmsize);
+	if (icdi->firmware_attr)
+		sysfs_remove_bin_file(&icdi->intf->dev.kobj, &bin_attr_firmware);
+/*	if (icdi->abort_attr)
+		device_remove_file(&icdi->intf->dev, &dev_attr_abort);
 	if (icdi->status_attr)
 		device_remove_file(&icdi->intf->dev, &dev_attr_status);
 	if (icdi->capbility_attr)
@@ -914,26 +698,16 @@ static int icdi_probe(struct usb_interface *intf,
 	}
 
 	icdi->intf = intf;
-/*	icdi->cap = dfufdsc->attr;
-	icdi->xfersize = le16_to_cpu(dfufdsc->xfersize);
-	icdi->dettmout = dfufdsc->tmout;
-	icdi->usbdev = interface_to_usbdev(intf);
-	icdi->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
-	icdi->proto = intf->cur_altsetting->desc.bInterfaceProtocol;
-	if (icdi->usbdev->bus->controller->dma_mask)
-		icdi->dma = 1;
-	else
-		icdi->dma = 0;*/
 	icdi->urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!icdi->urb) {
 		retv = -ENOMEM;
 		goto err_10;
 	}
 	mutex_init(&icdi->lock);
-
         usb_set_intfdata(intf, icdi);
+	get_erase_size(icdi);
 	icdi_create_attrs(icdi);
-	dev_info(&icdi->intf->dev, "TI USB ICDI inserted\n");
+	dev_info(&icdi->intf->dev, "TI USB ICDI board '%02X' inserted. Erase Size: %d\n", icdi->partno, icdi->erase_size);
 	return retv;
 
 err_10:
