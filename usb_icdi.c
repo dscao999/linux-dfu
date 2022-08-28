@@ -385,22 +385,25 @@ static int stop_debug(struct icdi_device *icdi, int firmware)
 	static const char debug_disable[] = "debug disable";
 
 	if (firmware) {
-	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, restore_vector, sizeof(restore_vector) - 1);
-	len = usb_sndrcv(icdi);
-	if (unlikely(len <= 0)) {
-		dump_response(icdi, len);
-		return len;
+		icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen,
+				restore_vector, sizeof(restore_vector) - 1);
+		len = usb_sndrcv(icdi);
+		if (unlikely(len <= 0)) {
+			dump_response(icdi, len);
+			return len;
+		}
+
+		icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen,
+				debug_hreset, sizeof(debug_hreset) - 1);
+		len = usb_sndrcv(icdi);
+		if (unlikely(len <= 0)) {
+			dump_response(icdi, len);
+			return len;
+		}
 	}
 
-	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, debug_hreset, sizeof(debug_hreset) - 1);
-	len = usb_sndrcv(icdi);
-	if (unlikely(len <= 0)) {
-		dump_response(icdi, len);
-		return len;
-	}
-	}
-
-	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen, debug_disable, sizeof(debug_disable) - 1);
+	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen,
+			debug_disable, sizeof(debug_disable) - 1);
 	len = usb_sndrcv(icdi);
 	if (unlikely(len <= 0)) {
 		dump_response(icdi, len);
@@ -476,7 +479,7 @@ static int get_erase_size(struct icdi_device *icdi)
 	switch(icdi->partno) {
 	case 0x2d:
 		icdi->erase_size = 16384;
-		bin_attr_firmware.size = 1048576;
+//		bin_attr_firmware.size = 1048576;
 		break;
 	case 0xa1:
 		icdi->erase_size = 1024;
@@ -494,6 +497,8 @@ exit_10:
 	return icdi->erase_size;
 }
 
+#define FLASH_READ_SIZE	256
+
 ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		struct bin_attribute *binattr, 
 		char *buf, loff_t offset, size_t bufsize)
@@ -507,21 +512,22 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 
 	if (unlikely(bufsize == 0))
 		return bufsize;
-	if (unlikely(bufsize % 128) != 0) {
+	if (unlikely(bufsize % FLASH_READ_SIZE) != 0) {
 		dev_err(&icdi->intf->dev, "Read Buffer Size %lu is not a " \
-				"multiple of 128\n", bufsize);
+				"multiple of %d\n", bufsize, FLASH_READ_SIZE);
 		return -EINVAL;
 	}
 	fm_size = binattr->size;
 	if (fm_size == 0)
 		fm_size = MAX_FMSIZE;
-
 	dev = container_of(kobj, struct device, kobj);
 	intf = container_of(dev, struct usb_interface, dev);
 	icdi = usb_get_intfdata(intf);
+
 	retv = 0;
 	mutex_lock(&icdi->lock);
-	icdi->buflen = 64 + 2 * icdi->erase_size;
+	rdlen = bufsize + offset < fm_size? bufsize : fm_size - offset;
+	icdi->buflen = 64 + 2 * rdlen;
 	icdi->buf = kmalloc(icdi->buflen, GFP_KERNEL);
 	if (unlikely(!icdi->buf)) {
 		dev_err(&icdi->intf->dev, "Out of Memory\n");
@@ -532,31 +538,33 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		start_debug(icdi, 1);
 		mem_write(icdi, FMA, 0);
 	}
+	if (offset >= fm_size)
+		goto exit_20;
+
 	curbuf = icdi->buf;
 	*curbuf++ = '$';
 	*curbuf++ = 'x';
 	uint2hexstr(offset, curbuf);
 	curbuf += 8;
 	*curbuf++ = ',';
-	rdlen = bufsize > icdi->erase_size? icdi->erase_size : bufsize;
 	uint2hexstr(rdlen, curbuf);
 	icdi->inflen = append_check_sum(icdi->buf, 19, icdi->buflen - 19);
 	len = usb_sndrcv(icdi);
 	if (unlikely(len < 0)) {
-		dev_err(&icdi->intf->dev, "Flash Dump failed: %08llx, length: " \
-				"%lu\n", offset, bufsize);
+		dev_err(&icdi->intf->dev, "Flash Dump failed at %08llx, " \
+				"length: %lu\n", offset, bufsize);
 		goto exit_20;
 	}
 	if (memcmp(icdi->buf, "+$OK:", 5) != 0) {
-		dev_err(&icdi->intf->dev, "Flash Dump Failed: %08llx, length: " \
-				"%lu\n", offset, bufsize);
+		dev_err(&icdi->intf->dev, "Flash Dump Failed at %08llx, " \
+				"length: %lu\n", offset, bufsize);
 		dump_response(icdi, 32);
 		goto exit_20;
 	}
 	dst = buf;
 	src = icdi->buf+5;
 	xferlen = 0;
-	while (src - icdi->buf < len - 3) {
+	while (src - icdi->buf < len - 3 && xferlen < bufsize) {
 		c = *src++;
 		if (c == '}')
 			c = (*src++) ^ 0x20;
