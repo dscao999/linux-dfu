@@ -590,7 +590,7 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	struct device *dev;
 	struct usb_interface *intf;
 	struct icdi_device *icdi;
-	int retv, len, xferlen, rdlen;
+	int retv, len, xferlen, rdlen, remlen;
 	unsigned long fm_size;
 	unsigned char *curbuf, *dst, *src, c;
 
@@ -614,8 +614,8 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 
 	retv = 0;
 	mutex_lock(&icdi->lock);
-	rdlen = bufsize + offset < fm_size? bufsize : fm_size - offset;
-	icdi->buflen = 64 + 2 * rdlen;
+	remlen = offset + bufsize > fm_size? fm_size - offset : bufsize;
+	icdi->buflen = 64 + 2 * icdi->erase_size;
 	icdi->buf = kmalloc(icdi->buflen, GFP_KERNEL);
 	if (unlikely(!icdi->buf)) {
 		dev_err(&icdi->intf->dev, "Out of Memory\n");
@@ -625,36 +625,42 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	if (offset >= fm_size)
 		goto exit_20;
 
-	curbuf = icdi->buf;
-	*curbuf++ = '$';
-	*curbuf++ = 'x';
-	uint2hexstr(offset, curbuf);
-	curbuf += 8;
-	*curbuf++ = ',';
-	uint2hexstr(rdlen, curbuf);
-	icdi->inflen = append_check_sum(icdi->buf, 19, icdi->buflen - 19);
-	len = usb_sndrcv(icdi);
-	if (unlikely(len < 0) || memcmp(icdi->buf, "+$OK:", 5) != 0) {
-		dev_err(&icdi->intf->dev, "Flash Dump failed at %08llx, " \
-				"length: %lu\n", offset, bufsize);
-		if (len > 0)
-			dump_response(icdi, len);
-		goto exit_20;
-	}
-	dst = buf;
-	src = icdi->buf+5;
-	xferlen = 0;
-	while (src - icdi->buf < len - 3 && xferlen < rdlen) {
-		c = *src++;
-		if (c == '}')
-			c = (*src++) ^ 0x20;
-		*dst++ = c;
-		xferlen += 1;
-	}
-	if (xferlen != rdlen)
-		dev_warn(dev, "Offset: %lld, read length: %d, actual transfer: %d\n",
-				offset, rdlen, xferlen);
-	retv = xferlen;
+	do {
+		rdlen = icdi->erase_size  < remlen? icdi->erase_size : remlen;
+		curbuf = icdi->buf;
+		*curbuf++ = '$';
+		*curbuf++ = 'x';
+		uint2hexstr(offset+retv, curbuf);
+		curbuf += 8;
+		*curbuf++ = ',';
+		uint2hexstr(rdlen, curbuf);
+		icdi->inflen = append_check_sum(icdi->buf, 19, icdi->buflen-19);
+		len = usb_sndrcv(icdi);
+		if (unlikely(len < 0) || memcmp(icdi->buf, "+$OK:", 5) != 0) {
+			dev_err(&icdi->intf->dev, "Flash Dump failed at " \
+					"%08llx, length: %d\n", offset + retv,
+					rdlen);
+			if (len > 0)
+				dump_response(icdi, len);
+			goto exit_20;
+		}
+		dst = buf + retv;
+		src = icdi->buf+5;
+		xferlen = 0;
+		while (src - icdi->buf < len - 3 && xferlen < rdlen) {
+			c = *src++;
+			if (c == '}')
+				c = (*src++) ^ 0x20;
+			*dst++ = c;
+			xferlen += 1;
+		}
+		if (xferlen != rdlen)
+			dev_warn(dev, "Offset: %lld, read length: %d, actual " \
+					"transfer: %d\n", offset + retv, rdlen,
+					xferlen);
+		retv += xferlen;
+		remlen -= xferlen;
+	} while (remlen > 0);
 
 exit_20:
 	kfree(icdi->buf);
