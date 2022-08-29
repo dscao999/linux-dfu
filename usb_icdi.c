@@ -32,6 +32,9 @@ struct icdi_device {
 	int buflen;
 	int inflen;
 	volatile int resp, nxfer;
+	unsigned int erase_size;
+	unsigned int erase_offset;
+	int partno;
 	union {
 		unsigned char attrs;
 		struct {
@@ -41,8 +44,6 @@ struct icdi_device {
 			unsigned int indebug_attr:1;
 		};
 	};
-	unsigned int erase_size;
-	int partno;
 };
 
 MODULE_LICENSE("GPL");
@@ -50,7 +51,7 @@ MODULE_AUTHOR("Dashi Cao");
 MODULE_DESCRIPTION("TI USB ICDI Driver");
 
 
-static int urb_timeout = 200; /* milliseconds */
+static int urb_timeout = 800; /* milliseconds */
 module_param(urb_timeout, int, 0644);
 MODULE_PARM_DESC(urb_timeout, "USB urb completion timeout. "
 	"Default: 200 milliseconds.");
@@ -100,30 +101,6 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 
 static BIN_ATTR_RW(firmware, 0);
 
-ssize_t firmware_write(struct file *filep, struct kobject *kobj,
-		struct bin_attribute *binattr,
-		char *buf, loff_t offset, size_t bufsize)
-{
-	struct device *dev;
-	struct usb_interface *intf;
-	struct icdi_device *icdi;
-	unsigned long fm_size;
-
-	if (unlikely(bufsize == 0))
-		return 0;
-	dev = container_of(kobj, struct device, kobj);
-	fm_size = binattr->size;
-	if (fm_size == 0) {
-		dev_err(dev, "The image size of DFU Device is unspecified. " \
-				"Cannot program the device\n");
-		return -EINVAL;
-	}
-
-	intf = container_of(dev, struct usb_interface, dev);
-	icdi = usb_get_intfdata(intf);
-	return 0;
-}
-
 static ssize_t fmsize_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -135,6 +112,10 @@ static ssize_t fmsize_store(struct device *dev,
 {
 	char *tmpbuf, *endchr;
 
+	if (bin_attr_firmware.size != 0) {
+		dev_warn(dev, "Firmware Size already set: %lu. Unable to modify\n", bin_attr_firmware.size);
+		return buflen;
+	}
 	tmpbuf = kmalloc(buflen+1, GFP_KERNEL);
 	if (!tmpbuf) {
 		dev_err(dev, "Out of Memory\n");
@@ -241,7 +222,7 @@ static int usb_sndrcv(struct icdi_device *icdi)
 	int retv, pos, len;
 	unsigned long jiff_wait;
 	char command[32];
-	unsigned char *curchr, sum = 0;
+	unsigned char *curchr, sum = 0, check;
 
 	pos = sizeof(command) - 1;
 	len = icdi->inflen > pos? pos : icdi->inflen;
@@ -263,7 +244,7 @@ static int usb_sndrcv(struct icdi_device *icdi)
 		dev_warn(&icdi->intf->dev, "URB bulk write operation timeout, command: %s\n", command);
 	}
 	retv = icdi->resp;
-	if (unlikely(retv != 0))
+	if (unlikely(retv < 0))
 		return retv;
 
 	pos = 0;
@@ -276,7 +257,7 @@ static int usb_sndrcv(struct icdi_device *icdi)
 		icdi->resp = -255;
 		icdi->nxfer = 0;
 		retv = usb_submit_urb(icdi->urb, GFP_KERNEL);
-		if (unlikely(retv != 0)) {
+		if (unlikely(retv < 0)) {
 			dev_err(&icdi->intf->dev, "URB bulk read submit failed: %d, command: %s\n", retv, command);
 			return retv;
 		}
@@ -286,7 +267,7 @@ static int usb_sndrcv(struct icdi_device *icdi)
 			dev_warn(&icdi->intf->dev, "URB bulk read operation timeout, command %s\n", command);
 		}
 		retv = icdi->resp;
-		if (unlikely(retv != 0)) {
+		if (unlikely(retv < 0)) {
 			dev_err(&icdi->intf->dev, "URB bulk read failed: %d, command: %s\n", retv, command);
 			return retv;
 		}
@@ -302,8 +283,8 @@ static int usb_sndrcv(struct icdi_device *icdi)
 	for (curchr = icdi->buf+len; *curchr != '#' && curchr < icdi->buf + pos;
 			curchr++)
 		sum+= *curchr;
-	retv = (hex2val(icdi->buf[pos-2]) << 4) | hex2val(icdi->buf[pos-1]);
-	if ((sum - retv) != 0)
+	check = (hex2val(icdi->buf[pos-2]) << 4) | hex2val(icdi->buf[pos-1]);
+	if ((sum - check) != 0)
 		dev_info(&icdi->intf->dev, "Raw response checksum error. " \
 				"check sum: %02hhx, retv: %x\n", sum, retv);
 	if (icdi->buf[0] != '+')
@@ -388,16 +369,16 @@ static int stop_debug(struct icdi_device *icdi, int firmware)
 		icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen,
 				restore_vector, sizeof(restore_vector) - 1);
 		len = usb_sndrcv(icdi);
-		if (unlikely(len <= 0)) {
-			dump_response(icdi, len);
+		if (unlikely(len < 0)) {
+			dev_err(&icdi->intf->dev, "debug vectorcatch 0 failed\n");
 			return len;
 		}
 
 		icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen,
 				debug_hreset, sizeof(debug_hreset) - 1);
 		len = usb_sndrcv(icdi);
-		if (unlikely(len <= 0)) {
-			dump_response(icdi, len);
+		if (unlikely(len < 0)) {
+			dev_err(&icdi->intf->dev, "debug hreset failed\n");
 			return len;
 		}
 	}
@@ -406,11 +387,11 @@ static int stop_debug(struct icdi_device *icdi, int firmware)
 			debug_disable, sizeof(debug_disable) - 1);
 	len = usb_sndrcv(icdi);
 	if (unlikely(len <= 0)) {
-		dump_response(icdi, len);
+		dev_err(&icdi->intf->dev, "debug disable failed\n");
 		return len;
 	}
 	icdi->indebug_attr = 0;
-	return len;
+	return 0;
 }
 
 static int start_debug(struct icdi_device *icdi, int firmware)
@@ -424,26 +405,34 @@ static int start_debug(struct icdi_device *icdi, int firmware)
 	icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen,
 			debug_clock, sizeof(debug_clock) - 1);
 	len = usb_sndrcv(icdi);
-	if (unlikely(len <= 0))
+	if (unlikely(len < 0)) {
+		dev_err(&icdi->intf->dev, "debug clock failed\n");
 		return retv;
+	}
 	len = sizeof(qSupported) - 1;
 	memcpy(icdi->buf, qSupported, len);
 	icdi->inflen = append_check_sum(icdi->buf, len, icdi->buflen);
 	len = usb_sndrcv(icdi);
-	if (unlikely(len <= 0))
+	if (unlikely(len < 0)) {
+		dev_err(&icdi->intf->dev, "qSupported failed\n");
 		return retv;
+	}
 	len = sizeof(qmark) - 1;
 	memcpy(icdi->buf, qmark, len);
 	icdi->inflen = append_check_sum(icdi->buf, len, icdi->buflen);
 	len = usb_sndrcv(icdi);
-	if (unlikely(len <= 0))
+	if (unlikely(len < 0)) {
+		dev_err(&icdi->intf->dev, "question mark failed\n");
 		return retv;
+	}
 	if (firmware) {
 		icdi->inflen = qRcmd_setup(icdi->buf, icdi->buflen,
 				debug_sreset, sizeof(debug_sreset) - 1);
 		len = usb_sndrcv(icdi);
-		if (unlikely(len <= 0))
+		if (unlikely(len < 0)) {
+			dev_err(&icdi->intf->dev, "debug sreset failed\n");
 			return retv;
+		}
 	}
 	val = mem_read(icdi, DHCSR);
 	if (val != 0x00030003)
@@ -479,11 +468,11 @@ static int get_erase_size(struct icdi_device *icdi)
 	switch(icdi->partno) {
 	case 0x2d:
 		icdi->erase_size = 16384;
-//		bin_attr_firmware.size = 1048576;
+		bin_attr_firmware.size = 1048576;
 		break;
 	case 0xa1:
 		icdi->erase_size = 1024;
-//		bin_attr_firmware.size = 256000;
+		bin_attr_firmware.size = 262144;
 		break;
 	default:
 		icdi->erase_size = 4096;
@@ -512,6 +501,7 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 
 	if (unlikely(bufsize == 0))
 		return bufsize;
+	dev = container_of(kobj, struct device, kobj);
 	if (unlikely(bufsize % FLASH_READ_SIZE) != 0) {
 		dev_err(&icdi->intf->dev, "Read Buffer Size %lu is not a " \
 				"multiple of %d\n", bufsize, FLASH_READ_SIZE);
@@ -520,7 +510,6 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	fm_size = binattr->size;
 	if (fm_size == 0)
 		fm_size = MAX_FMSIZE;
-	dev = container_of(kobj, struct device, kobj);
 	intf = container_of(dev, struct usb_interface, dev);
 	icdi = usb_get_intfdata(intf);
 
@@ -535,7 +524,11 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		goto exit_10;
 	}
 	if (offset == 0) {
-		start_debug(icdi, 1);
+		retv = start_debug(icdi, 1);
+		if (retv != 0) {
+			dev_err(dev, "Cannot change into debug state\n");
+			goto exit_20;
+		}
 		mem_write(icdi, FMA, 0);
 	}
 	if (offset >= fm_size)
@@ -564,7 +557,7 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	dst = buf;
 	src = icdi->buf+5;
 	xferlen = 0;
-	while (src - icdi->buf < len - 3 && xferlen < bufsize) {
+	while (src - icdi->buf < len - 3 && xferlen < rdlen) {
 		c = *src++;
 		if (c == '}')
 			c = (*src++) ^ 0x20;
@@ -572,18 +565,134 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		xferlen += 1;
 	}
 	if (xferlen != rdlen)
-		dev_info(&icdi->intf->dev, "Offset: %lld, read length: %d, actual transfer: %d\n",
+		dev_info(dev, "Offset: %lld, read length: %d, actual transfer: %d\n",
 				offset, rdlen, xferlen);
 	retv = xferlen;
+	if (offset + xferlen == fm_size && icdi->indebug_attr) {
+		if (stop_debug(icdi, 1) != 0)
+			dev_err(dev, "Cannot Jump out of debug state\n");
+	}
 
 exit_20:
-	if (retv <= 0)
-		stop_debug(icdi, 1);
+	if (retv < 0 && icdi->indebug_attr)
+		if (stop_debug(icdi, 1) != 0)
+			dev_err(dev, "Cannot Jump out of debug state\n");
 	kfree(icdi->buf);
 	icdi->buf = NULL;
 exit_10:
 	icdi->buflen = 0;
 	mutex_unlock(&icdi->lock);
+	return retv;
+}
+
+ssize_t firmware_write(struct file *filep, struct kobject *kobj,
+		struct bin_attribute *binattr,
+		char *buf, loff_t offset, size_t bufsize)
+{
+	struct device *dev;
+	struct usb_interface *intf;
+	struct icdi_device *icdi;
+	unsigned long fm_size;
+	int remlen, wtlen, len, retv, i;
+	unsigned char *curchr, c;
+	static const char flash_erase[] = "$vFlashErase:";
+	static const char flash_write[] = "$vFlashWrite:";
+
+	dev = container_of(kobj, struct device, kobj);
+	if (bufsize % FLASH_READ_SIZE) {
+		dev_err(dev, "The flash programming size %lu is not a mutiple of %d\n", bufsize, FLASH_READ_SIZE);
+		return -EINVAL;
+	}
+	fm_size = binattr->size;
+	if (fm_size == 0) {
+		dev_err(dev, "The flash size of the Device is unspecified. " \
+				"Cannot program the device\n");
+		return -ENXIO;
+	}
+	if (unlikely(bufsize == 0))
+		return 0;
+	if (offset >= fm_size) {
+		dev_err(dev, "Cannot program past the flash size. " \
+				"offset: %lld, size: %lu\n", offset, fm_size);
+		return -ENXIO;
+	}
+
+	retv = 0;
+	intf = container_of(dev, struct usb_interface, dev);
+	icdi = usb_get_intfdata(intf);
+	remlen = offset + bufsize < fm_size? bufsize : fm_size - offset;
+	icdi->buflen = 64 + 2 * icdi->erase_size;
+	icdi->buf = kmalloc(icdi->buflen, GFP_KERNEL);
+	if (unlikely(!icdi->buf)) {
+		dev_err(dev, "Out of Memory\n");
+		icdi->buflen = 0;
+		return -ENOMEM;
+	}
+	mutex_lock(&icdi->lock);
+	if (offset == 0) {
+		icdi->erase_offset = 0;
+		retv = start_debug(icdi, 1);
+		if (retv != 0) {
+			dev_info(dev, "Cannot change into debug state\n");
+			return retv;
+		}
+		mem_write(icdi, FMA, 0);
+	}
+	while (offset + remlen > icdi->erase_offset) {
+		len = sizeof(flash_erase) - 1;
+		memcpy(icdi->buf, flash_erase, len);
+		uint2hexstr(icdi->erase_offset, icdi->buf + len);
+		len += 8;
+		icdi->buf[len++] = ',';
+		uint2hexstr(icdi->erase_size, icdi->buf + len);
+		len += 8;
+		icdi->inflen = append_check_sum(icdi->buf, len, icdi->buflen);
+		len = usb_sndrcv(icdi);
+		if (len < 0 || memcmp(icdi->buf, "+$OK", 4) != 0) {
+			dev_err(dev, "Unable to erase. Offset: %u, size: %u\n", icdi->erase_offset, icdi->erase_size);
+			goto exit_20;
+		}
+		icdi->erase_offset += icdi->erase_size;
+	}
+
+	do {
+		wtlen = icdi->erase_size > remlen? remlen : icdi->erase_size;
+		len = sizeof(flash_write) - 1;
+		memcpy(icdi->buf, flash_write, len);
+		uint2hexstr(offset+retv, icdi->buf + len);
+		len += 8;
+		icdi->buf[len++] = ':';
+		curchr = icdi->buf + len;
+		for (i = retv; i < retv+wtlen; i++) {
+			c = buf[i];
+			if (c == '#' || c == '$' || c == '}') {
+				*curchr++ = '}';
+				c ^= 0x20;
+			}
+			*curchr++ = c;
+		}
+		len = (curchr - icdi->buf);
+		icdi->inflen = append_check_sum(icdi->buf, len, icdi->buflen);
+		len = usb_sndrcv(icdi);
+		if (len < 0 || memcmp(icdi->buf, "+$OK", 4) != 0) {
+			dev_err(dev, "Cannot program the flash. Offset: %lld, size: %d\n", offset+retv, wtlen);
+			goto exit_20;
+		}
+		retv += wtlen;
+		remlen -= wtlen;
+	} while (remlen > 0);
+	if (offset + retv == fm_size)
+		if (stop_debug(icdi, 1) != 0)
+			dev_err(dev, "Cannot jump out of debug state\n");
+
+
+exit_20:
+	if (retv < 0 && icdi->indebug_attr)
+		if (stop_debug(icdi, 1) != 0)
+			dev_err(dev, "Cannot jump out of debug state\n");
+	mutex_unlock(&icdi->lock);
+	kfree(icdi->buf);
+	icdi->buflen = 0;
 	return retv;
 }
 
@@ -611,8 +720,10 @@ static ssize_t version_show(struct device *dev,
 	if (len > 5)
 		retv = hexstr2byte(icdi->buf+2, len - 5, buf, 4096);
 	else {
-		memcpy(buf, icdi->buf, len);
+		dev_err(&icdi->intf->dev, "Command 'version' failed\n");
 		retv = len;
+		if (retv > 0)
+			memcpy(buf, icdi->buf, retv);
 	}
 	kfree(icdi->buf);
 	icdi->buf = NULL;
