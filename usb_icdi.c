@@ -503,12 +503,80 @@ static int start_debug(struct icdi_device *icdi, int firmware,
 	return 0;
 }
 
+#define PROG_SIZE	1024
+
 static int write_block(struct icdi_device *icdi)
 {
+	int buflen, len, inflen, retv = 0, i, proged, remlen, plen;
+	char *urbuf, *dst, *src, c;
+	struct device *dev = &icdi->intf->dev;
+	static const char flash_erase[] = "$vFlashErase:";
+	static const char flash_write[] = "$vFlashWrite:";
+
 	if (icdi->flash.nxtpos == 0)
-		return 0;
+		return retv;
 	dev_info(&icdi->intf->dev, "Erase and Program. Offset: %d, length: %d\n", icdi->flash.offset, icdi->flash.nxtpos);
-	return 0;
+
+	buflen = 64 + 2 * PROG_SIZE;
+	urbuf = kmalloc(buflen, GFP_KERNEL);
+	if (unlikely(!urbuf)) {
+		dev_err(dev, "Out of Memory\n");
+		return -ENOMEM;
+	}
+	len = sizeof(flash_erase) - 1;
+	memcpy(urbuf, flash_erase, len);
+	uint2hexstr(icdi->flash.offset, urbuf + len);
+	len += 8;
+	urbuf[len++] = ',';
+	uint2hexstr(icdi->erase_size, urbuf + len);
+	len += 8;
+	inflen = append_check_sum(urbuf, len, buflen);
+	len = usb_sndrcv(icdi, urbuf, inflen, buflen);
+	if (len < 0 || memcmp(urbuf, "+$OK", 4) != 0) {
+		dev_err(dev, "Unable to erase. Offset: %d, size: %u\n",
+				icdi->flash.offset, icdi->erase_size);
+		if (len > 0)
+			dump_response(dev, urbuf, len);
+		retv = -1;
+		goto exit_10;
+	}
+
+	remlen = icdi->flash.nxtpos;
+	proged = 0;
+	while (remlen > 0) {
+		len = sizeof(flash_write) - 1;
+		memcpy(urbuf, flash_write, len);
+		uint2hexstr(icdi->flash.offset+proged, urbuf + len);
+		len += 8;
+		urbuf[len++] = ':';
+		dst = urbuf + len;
+		src = icdi->flash.block + proged;
+		plen = remlen > PROG_SIZE? PROG_SIZE : remlen;
+		for (i = 0; i < plen; i++) {
+			c = *src++;
+			if (c == '#' || c == '$' || c == '}') {
+				*dst++ = '}';
+				c ^= 0x20;
+			}
+			*dst++ = c;
+		}
+		len = dst - urbuf;
+		inflen = append_check_sum(urbuf, len, buflen);
+		len = usb_sndrcv(icdi, urbuf, inflen, buflen);
+		if (len < 0 || memcmp(urbuf, "+$OK", 4) != 0) {
+			dev_err(dev, "Cannot program the flash. Offset: %d, size: %d\n",
+				       icdi->flash.offset, icdi->flash.nxtpos);
+			if (len > 0)
+				dump_response(dev, urbuf, len);
+			retv = -1;
+		}
+		proged += plen;
+		remlen -= plen;
+	}
+
+exit_10:
+	kfree(urbuf);
+	return retv;
 }
 
 static int program_block(struct icdi_device *icdi, const char *buf, int buflen,
@@ -516,35 +584,41 @@ static int program_block(struct icdi_device *icdi, const char *buf, int buflen,
 {
 	const char *src;
 	char *dst;
-	int onemove, remlen, datlen, retv;
+	int onemove, remlen, datlen, retv, nxfer;
 
-	if (icdi->flash.offset + icdi->flash.nxtpos!= offset) {
+	if (icdi->flash.offset + icdi->flash.nxtpos != offset) {
 		dev_err(&icdi->intf->dev, "Not Continuous in one flash " \
 				"operation. prev offset: %u, current offset: " \
 				"%u\n", icdi->flash.offset+icdi->flash.nxtpos,
 				offset);
 		return -1;
 	}
-	dst = icdi->flash.block + icdi->flash.nxtpos;
 	src = buf;
 	datlen = buflen;
+	nxfer = 0;
 	while (datlen > 0) {
+		dst = icdi->flash.block + icdi->flash.nxtpos;
 		remlen = icdi->erase_size - icdi->flash.nxtpos;
 		onemove = datlen < remlen? datlen : remlen;
 		memcpy(dst, src, onemove);
-		dst += onemove;
 		src += onemove;
-		datlen -= onemove;
 		icdi->flash.nxtpos += onemove;
+		datlen -= onemove;
+		remlen -= onemove;
 		if (remlen == 0) {
 			retv = write_block(icdi);
-			if (retv != 0)
-				return retv;
+			if (retv != 0) {
+				dev_err(&icdi->intf->dev,
+						"Flash Programming Failed\n");
+				return nxfer;
+			}
 			icdi->flash.nxtpos = 0;
 			icdi->flash.offset += icdi->erase_size;
 		}
+		nxfer += onemove;
 	}
-	return 0;
+	WARN_ON(nxfer != buflen);
+	return nxfer;
 }
 
 static ssize_t debug_show(struct device *dev,
@@ -795,11 +869,6 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 	struct icdi_device *icdi;
 	unsigned long fm_size;
 	int retv;
-//	int remlen, wtlen, len, retv, i, inflen, buflen;
-//	char *curchr, c, *urbuf;
-//	unsigned erase_offset;
-//	static const char flash_erase[] = "$vFlashErase:";
-//	static const char flash_write[] = "$vFlashWrite:";
 
 	dev = container_of(kobj, struct device, kobj);
 	if (bufsize % FLASH_READ_SIZE) {
@@ -828,69 +897,8 @@ ssize_t firmware_write(struct file *filep, struct kobject *kobj,
 		return -EREMOTEIO;
 	}
 	mutex_lock(&icdi->lock);
-	program_block(icdi, buf, bufsize, offset);
-	retv = bufsize;
-
-/*	remlen = offset + bufsize < fm_size? bufsize : fm_size - offset;
-	buflen = 64 + 2 * icdi->erase_size;
-	urbuf = kmalloc(buflen, GFP_KERNEL);
-	if (unlikely(!urbuf)) {
-		dev_err(dev, "Out of Memory\n");
-		return -ENOMEM;
-	}
-	erase_offset = 0;
-	while (remlen > erase_offset) {
-		len = sizeof(flash_erase) - 1;
-		memcpy(urbuf, flash_erase, len);
-		uint2hexstr(offset+erase_offset, urbuf + len);
-		len += 8;
-		urbuf[len++] = ',';
-		uint2hexstr(icdi->erase_size, urbuf + len);
-		len += 8;
-		inflen = append_check_sum(urbuf, len, buflen);
-		len = usb_sndrcv(icdi, urbuf, inflen, buflen);
-		if (len < 0 || memcmp(urbuf, "+$OK", 4) != 0) {
-			dev_err(dev, "Unable to erase. Offset: %lld, size: %u\n",
-					offset+erase_offset, icdi->erase_size);
-			if (len > 0)
-				dump_response(dev, urbuf, len);
-			goto exit_20;
-		}
-		erase_offset += icdi->erase_size;
-	}
-
-	do {
-		wtlen = icdi->erase_size > remlen? remlen : icdi->erase_size;
-		len = sizeof(flash_write) - 1;
-		memcpy(urbuf, flash_write, len);
-		uint2hexstr(offset+retv, urbuf + len);
-		len += 8;
-		urbuf[len++] = ':';
-		curchr = urbuf + len;
-		for (i = retv; i < retv+wtlen; i++) {
-			c = buf[i];
-			if (c == '#' || c == '$' || c == '}') {
-				*curchr++ = '}';
-				c ^= 0x20;
-			}
-			*curchr++ = c;
-		}
-		len = (curchr - urbuf);
-		inflen = append_check_sum(urbuf, len, buflen);
-		len = usb_sndrcv(icdi, urbuf, inflen, buflen);
-		if (len < 0 || memcmp(urbuf, "+$OK", 4) != 0) {
-			dev_err(dev, "Cannot program the flash. Offset: %lld, size: %d\n", offset+retv, wtlen);
-			if (len > 0)
-				dump_response(dev, urbuf, len);
-			goto exit_20;
-		}
-		retv += wtlen;
-		remlen -= wtlen;
-	} while (remlen > 0); */
-
-
+	retv = program_block(icdi, buf, bufsize, offset);
 	mutex_unlock(&icdi->lock);
-//	kfree(urbuf);
 	return retv;
 }
 
