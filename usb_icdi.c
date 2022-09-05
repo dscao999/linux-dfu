@@ -515,7 +515,6 @@ static int write_block(struct icdi_device *icdi)
 
 	if (icdi->flash.nxtpos == 0)
 		return retv;
-	dev_info(&icdi->intf->dev, "Erase and Program. Offset: %d, length: %d\n", icdi->flash.offset, icdi->flash.nxtpos);
 
 	buflen = 64 + 2 * PROG_SIZE;
 	urbuf = kmalloc(buflen, GFP_KERNEL);
@@ -806,7 +805,7 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 	retv = 0;
 	mutex_lock(&icdi->lock);
 	remlen = offset + bufsize > fm_size? fm_size - offset : bufsize;
-	buflen = 64 + 2 * icdi->erase_size;
+	buflen = 64 + 2 * PROG_SIZE;
 	urbuf = kmalloc(buflen, GFP_KERNEL);
 	if (unlikely(!urbuf)) {
 		dev_err(&icdi->intf->dev, "Out of Memory\n");
@@ -817,7 +816,7 @@ ssize_t firmware_read(struct file *filep, struct kobject *kobj,
 		goto exit_20;
 
 	do {
-		rdlen = icdi->erase_size  < remlen? icdi->erase_size : remlen;
+		rdlen = PROG_SIZE  < remlen? PROG_SIZE : remlen;
 		curbuf = urbuf;
 		*curbuf++ = '$';
 		*curbuf++ = 'x';
