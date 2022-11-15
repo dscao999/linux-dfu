@@ -240,17 +240,11 @@ static void dump_response(struct device *dev, char *urbuf, int reslen)
 	kfree(buf);
 }
 
-static int usb_sndrcv(struct icdi_device *icdi, char *urbuf, int inflen, int buflen)
+static int usb_send(struct icdi_device *icdi, char *urbuf, int inflen)
 {
-	int retv, pos, len;
+	int retv = 0;
 	unsigned long jiff_wait;
-	char command[32];
-	char *curchr, sum = 0, check;
 
-	pos = sizeof(command) - 1;
-	len = inflen > pos? pos : inflen;
-	memcpy(command, urbuf, len);
-	command[len] = 0;
 	usb_fill_bulk_urb(icdi->urb, icdi->usbdev, icdi->pipe_out,
 			urbuf, inflen, icdi_urb_done, icdi);
 	init_completion(&icdi->urbdone);
@@ -258,50 +252,76 @@ static int usb_sndrcv(struct icdi_device *icdi, char *urbuf, int inflen, int buf
 	icdi->nxfer = 0;
 	retv = usb_submit_urb(icdi->urb, GFP_KERNEL);
 	if (unlikely(retv != 0)) {
-		dev_err(&icdi->intf->dev, "URB bulk write submit failed: %d, " \
-				"command: %s\n", retv, command);
+		dev_err(&icdi->intf->dev, "URB bulk write submit failed: %d\n", retv);
 		return retv;
 	}
 	jiff_wait = msecs_to_jiffies(urb_timeout);
 	if (!wait_for_completion_timeout(&icdi->urbdone, jiff_wait)) {
 		icdi_urb_timeout(icdi);
-		dev_warn(&icdi->intf->dev, "URB bulk write operation timeout," \
-			       " command: %s\n", command);
+		dev_warn(&icdi->intf->dev, "URB bulk write operation timeout\n");
 	}
 	retv = icdi->resp;
 	if (unlikely(retv < 0))
+		dev_err(&icdi->intf->dev, "URB bulk write operation failed: %d\n", retv);
+	return retv;
+}
+
+static int usb_recv(struct icdi_device *icdi, char *urbuf, int buflen)
+{
+	int retv = 0;
+	unsigned long jiff_wait;
+
+	usb_fill_bulk_urb(icdi->urb, icdi->usbdev, icdi->pipe_in,
+			urbuf, buflen, icdi_urb_done, icdi);
+	init_completion(&icdi->urbdone);
+	icdi->resp = -255;
+	icdi->nxfer = 0;
+	retv = usb_submit_urb(icdi->urb, GFP_KERNEL);
+	if (unlikely(retv < 0)) {
+		dev_err(&icdi->intf->dev, "URB bulk read submit failed: %d\n", retv);
 		return retv;
+	}
+	jiff_wait = msecs_to_jiffies(urb_timeout);
+	if (!wait_for_completion_timeout(&icdi->urbdone, jiff_wait)) {
+		icdi_urb_timeout(icdi);
+		dev_warn(&icdi->intf->dev, "URB bulk read operation timeout\n");
+	}
+	retv = icdi->resp;
+	if (unlikely(retv < 0))
+		dev_err(&icdi->intf->dev, "URB bulk read failed: %d\n", retv);
+	return retv;
+}
+
+static int usb_sndrcv(struct icdi_device *icdi, char *urbuf, int inflen, int buflen)
+{
+	int retv, pos, len;
+	char *curchr, sum = 0, check;
+	char command[32];
+
+	pos = sizeof(command) - 1;
+	len = inflen > pos? pos : inflen;
+	memcpy(command, urbuf, len);
+	command[len] = 0;
+
+	retv = usb_send(icdi, urbuf, inflen);
+	if (unlikely(retv < 0)) {
+		dev_err(&icdi->intf->dev, "Cannot send command %s: %d\n", command ,retv);
+		return retv;
+	}
 
 	pos = 0;
 	urbuf[0] = '+';
 	do {
-		usb_fill_bulk_urb(icdi->urb, icdi->usbdev, icdi->pipe_in,
-				urbuf + pos, buflen - pos,
-				icdi_urb_done, icdi);
-		init_completion(&icdi->urbdone);
-		icdi->resp = -255;
-		icdi->nxfer = 0;
-		retv = usb_submit_urb(icdi->urb, GFP_KERNEL);
-		if (unlikely(retv < 0)) {
-			dev_err(&icdi->intf->dev, "URB bulk read submit " \
-					"failed: %d, command: %s\n",
-					retv, command);
-			return retv;
-		}
-		jiff_wait = msecs_to_jiffies(urb_timeout);
-		if (!wait_for_completion_timeout(&icdi->urbdone, jiff_wait)) {
-			icdi_urb_timeout(icdi);
-			dev_warn(&icdi->intf->dev, "URB bulk read operation " \
-					"timeout, command %s\n", command);
-		}
-		retv = icdi->resp;
-		if (unlikely(retv < 0)) {
-			dev_err(&icdi->intf->dev, "URB bulk read failed: %d, " \
-					"command: %s\n", retv, command);
-			return retv;
-		}
+		retv = usb_recv(icdi, urbuf+pos, buflen-pos);
+		if (retv < 0)
+			break;
 		pos += icdi->nxfer;
 	} while ((pos < 3 || urbuf[pos-3] != '#') && urbuf[0] == '+');
+	if (retv < 0) {
+		dev_err(&icdi->intf->dev, "Cannot receive response of '%s': %d\n", command, retv);
+		return retv;
+	}
+
 	urbuf[pos] = 0;
 	if (memcmp(urbuf, "+$OK:", 5) == 0)
 		len = 5;
