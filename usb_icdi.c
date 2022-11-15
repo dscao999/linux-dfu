@@ -505,16 +505,18 @@ static int start_debug(struct icdi_device *icdi, int firmware,
 
 #define PROG_SIZE	1024
 
-static int write_block(struct icdi_device *icdi)
+static int write_block(struct icdi_device *icdi, int finish)
 {
 	int buflen, len, inflen, retv = 0, i, proged, remlen, plen;
 	char *urbuf, *dst, *src, c;
 	struct device *dev = &icdi->intf->dev;
 	static const char flash_erase[] = "$vFlashErase:";
 	static const char flash_write[] = "$vFlashWrite:";
+	static const char flash_done[] = "$vFlashDone";
 
+	urbuf = NULL;
 	if (icdi->flash.nxtpos == 0)
-		return retv;
+		goto flash_done;
 
 	buflen = 64 + 2 * PROG_SIZE;
 	urbuf = kmalloc(buflen, GFP_KERNEL);
@@ -573,8 +575,31 @@ static int write_block(struct icdi_device *icdi)
 		remlen -= plen;
 	}
 
+flash_done:
+	if (finish) {
+		if (urbuf == NULL) {
+			buflen = 64;
+			urbuf = kmalloc(buflen, GFP_KERNEL);
+			if (unlikely(!urbuf)) {
+				dev_err(dev, "Out of Memory\n");
+				return -ENOMEM;
+			}
+		}
+		len = sizeof(flash_done) - 1;
+		memcpy(urbuf, flash_done, len);
+		inflen = append_check_sum(urbuf, len, buflen);
+		len = usb_sndrcv(icdi, urbuf, inflen, buflen);
+		if (len < 0 || memcmp(urbuf, "+$OK", 4) != 0) {
+			dev_err(dev, "flush done sent failed.\n");
+			if (len > 0)
+				dump_response(dev, urbuf, len);
+			retv = -1;
+		}
+	}
+
 exit_10:
-	kfree(urbuf);
+	if (urbuf)
+		kfree(urbuf);
 	return retv;
 }
 
@@ -605,7 +630,7 @@ static int program_block(struct icdi_device *icdi, const char *buf, int buflen,
 		datlen -= onemove;
 		remlen -= onemove;
 		if (remlen == 0) {
-			retv = write_block(icdi);
+			retv = write_block(icdi, 0);
 			if (retv != 0) {
 				dev_err(&icdi->intf->dev,
 						"Flash Programming Failed\n");
@@ -699,7 +724,7 @@ static ssize_t debug_store(struct device *dev,
 		if (icdi->in_debug == 0)
 			goto exit_20;
 		if (icdi->stalled) {
-			retv = write_block(icdi);
+			retv = write_block(icdi, 1);
 			kfree(icdi->flash.block);
 			icdi->flash.block = NULL;
 		}
