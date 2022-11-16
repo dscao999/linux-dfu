@@ -10,6 +10,7 @@ else
 
 all:
 	$(MAKE) -C $(KERNELDIR) M=$(WDIR) modules
+	cscope -b -q -k
 
 clean:
 	@rm -f modules.order Module.symvers

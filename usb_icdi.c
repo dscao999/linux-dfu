@@ -292,23 +292,14 @@ static int usb_recv(struct icdi_device *icdi, char *urbuf, int buflen)
 	return retv;
 }
 
-static int usb_sndrcv(struct icdi_device *icdi, char *urbuf, int inflen, int buflen)
+static int do_usb_sndrcv(struct icdi_device *icdi, char *urbuf, int inflen,
+		int buflen)
 {
-	int retv, pos, len;
-	char *curchr, sum = 0, check;
-	char command[32];
-
-	pos = sizeof(command) - 1;
-	len = inflen > pos? pos : inflen;
-	memcpy(command, urbuf, len);
-	command[len] = 0;
+	int retv, pos;
 
 	retv = usb_send(icdi, urbuf, inflen);
-	if (unlikely(retv < 0)) {
-		dev_err(&icdi->intf->dev, "Cannot send command %s: %d\n", command ,retv);
+	if (unlikely(retv < 0))
 		return retv;
-	}
-
 	pos = 0;
 	urbuf[0] = '+';
 	do {
@@ -316,31 +307,64 @@ static int usb_sndrcv(struct icdi_device *icdi, char *urbuf, int inflen, int buf
 		if (retv < 0)
 			break;
 		pos += icdi->nxfer;
-	} while ((pos < 3 || urbuf[pos-3] != '#') && urbuf[0] == '+');
-	if (retv < 0) {
-		dev_err(&icdi->intf->dev, "Cannot receive response of '%s': %d\n", command, retv);
-		return retv;
+	} while ((pos < 3 || urbuf[pos-3] != '#') && (urbuf[0] == '+' ||
+				urbuf[0] == '-'));
+	if (retv == 0)
+		retv = pos;
+	return retv;
+}
+
+
+static int usb_sndrcv(struct icdi_device *icdi, char *urbuf, int inflen,
+		int buflen)
+{
+	int retv, len, resend;
+	char *curchr, sum, check;
+	char *cmd;
+
+	cmd = kmalloc(inflen+1, GFP_KERNEL);
+	if (unlikely(!cmd)) {
+		dev_err(&icdi->intf->dev, "Out of Memory\n");
+		return -ENOMEM;
+	}
+	memcpy(cmd, urbuf, inflen);
+
+	do {
+		resend = 0;
+		retv = do_usb_sndrcv(icdi, urbuf, inflen, buflen);
+		if (retv < 0) {
+			cmd[len] = 0;
+			dev_err(&icdi->intf->dev, "command %s failed: %d\n",
+					cmd ,retv);
+			break;
+		} else if (urbuf[0] == '-') {
+			resend = 1;
+			memcpy(urbuf, cmd, inflen);
+		}
+	} while (resend == 1);
+	if (retv < 0)
+		goto exit_10;
+
+	len = retv;
+	if (memcmp(urbuf, "+$OK:", 5) == 0 && urbuf[len-3] == '#') {
+		sum = 0;
+		for (curchr = urbuf+5; curchr < urbuf + len - 3; curchr++)
+			sum += *curchr;
+		check = (hex2val(urbuf[len-2]) << 4) | hex2val(urbuf[len-1]);
+		if ((sum - check) != 0) {
+			dev_warn(&icdi->intf->dev, "response checksum error. " \
+					"computed: %02hhx, in packet: %02hhx\n",
+					sum, check);
+			cmd[inflen] = 0;
+			dev_info(&icdi->intf->dev, "Command is: %s\n", cmd);
+			urbuf[len] = 0;
+			dev_info(&icdi->intf->dev, "Response is: %s\n", urbuf);
+		}
 	}
 
-	urbuf[pos] = 0;
-	if (memcmp(urbuf, "+$OK:", 5) == 0)
-		len = 5;
-	else if (memcmp(urbuf, "+$E07:", 6) == 0)
-		len = 6;
-	else
-		len = 2;
-	for (curchr = urbuf+len; *curchr != '#' && curchr < urbuf + pos;
-			curchr++)
-		sum+= *curchr;
-	check = (hex2val(urbuf[pos-2]) << 4) | hex2val(urbuf[pos-1]);
-	if ((sum - check) != 0)
-		dev_info(&icdi->intf->dev, "Raw response checksum error. " \
-				"check sum: %02hhx, retv: %x\n", sum, retv);
-	if (urbuf[0] != '+')
-		dev_err(&icdi->intf->dev, "No response from command: %s\n",
-				command);
-
-	return pos;
+exit_10:
+	kfree(cmd);
+	return retv;
 }
 
 static const char qRcmd[] = "$qRcmd,";
