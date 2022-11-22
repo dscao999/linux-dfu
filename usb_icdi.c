@@ -12,6 +12,8 @@
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
 
 #define MODULE_NAME	"usb_icdi"
 
@@ -28,6 +30,7 @@ struct flash_block {
 
 struct icdi_device {
 	struct mutex lock;
+	struct cdev cdev;
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
 	struct completion urbdone;
@@ -333,7 +336,7 @@ static int usb_sndrcv(struct icdi_device *icdi, char *urbuf, int inflen,
 		resend = 0;
 		retv = do_usb_sndrcv(icdi, urbuf, inflen, buflen);
 		if (retv < 0) {
-			cmd[len] = 0;
+			cmd[inflen+1] = 0;
 			dev_err(&icdi->intf->dev, "command %s failed: %d\n",
 					cmd ,retv);
 			break;
